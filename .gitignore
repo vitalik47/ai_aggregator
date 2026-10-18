@@ -1,0 +1,31 @@
+# Секреты (никогда не коммитить!)
+.env
+
+# Виртуальное окружение
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Telethon
+*.session
+*.session-journal
+
+# База данных
+*.db
+*.sqlite
+*.sqlite3
+
+# Логи
+*.log
+app.log
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
