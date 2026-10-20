@@ -120,6 +120,12 @@ MENU_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
 ])
 
 NO_NEWS_TEXT = "Новостей пока нет. Подождите, пока агенты их соберут."
+# Названия месяцев в родительном падеже для даты «20 октября 2026».
+# strftime("%B") зависит от языка Windows, поэтому пишем их сами
+MONTHS = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
 
 dp = Dispatcher()
 
@@ -171,6 +177,13 @@ def split_text(text):
     return parts
 
 
+def with_time(text):
+    """Добавляет в начало текста дату и время ответа: «📅 20 октября 2026, 17:45»."""
+    # datetime.now() без часового пояса — это время компьютера, где запущен бот
+    now = datetime.now()
+    return f"📅 {now.day} {MONTHS[now.month - 1]} {now.year}, {now:%H:%M}\n\n{text}"
+
+
 async def send_long(message: Message, text):
     """Отправляет текст любой длины несколькими сообщениями."""
     for part in split_text(text):
@@ -184,16 +197,16 @@ async def send_long(message: Message, text):
 def news_text():
     events = get_recent_events(10)
     if not events:
-        return NO_NEWS_TEXT
-    return "📰 Последние новости:\n\n" + "\n\n".join(format_event(e) for e in events)
+        return with_time(NO_NEWS_TEXT)
+    return with_time("📰 Последние новости:\n\n" + "\n\n".join(format_event(e) for e in events))
 
 
 def top_text():
     # Берём последние 50 событий и выбираем 5 с самым высоким insider_score
     events = sorted(get_recent_events(50), key=lambda e: e["insider_score"], reverse=True)[:5]
     if not events:
-        return NO_NEWS_TEXT
-    return "🕵️ Самые инсайдерские новости:\n\n" + "\n\n".join(format_event(e) for e in events)
+        return with_time(NO_NEWS_TEXT)
+    return with_time("🕵️ Самые инсайдерские новости:\n\n" + "\n\n".join(format_event(e) for e in events))
 
 
 def tag_text(command_name):
@@ -201,8 +214,8 @@ def tag_text(command_name):
     tag, header = TAG_COMMANDS[command_name]
     events = get_events_by_tag(tag, limit=5)
     if not events:
-        return f"Новостей с темой {header} пока нет."
-    return f"{header} — последние новости:\n\n" + "\n\n".join(format_event(e) for e in events)
+        return with_time(f"Новостей с темой {header} пока нет.")
+    return with_time(f"{header} — последние новости:\n\n" + "\n\n".join(format_event(e) for e in events))
 
 
 def sentiment_text(topic):
@@ -322,7 +335,8 @@ async def personal_ai_text(action, user_id):
         text = await make_digest(topics=topics)
     if topics:
         text = f"🎯 Ваши темы: {topics_title(topics)} (изменить: /settings)\n\n" + text
-    return text
+    # Время ставим после ответа GPT — в момент, когда брифинг или дайджест готов
+    return with_time(text)
 
 
 # ============================================================

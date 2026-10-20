@@ -17,13 +17,15 @@ import logging
 from agent_1_scraper import run_scraper
 from agent_2_filter import run_filter
 from bot import run_bot
-from database import init_db
+from config import KEEP_DAYS
+from database import clean_old_events, init_db
 
 logger = logging.getLogger(__name__)
 
 
 async def main():
     init_db()
+    clean_old_events(KEEP_DAYS)
     logger.info("AI Aggregator запускается...")
     # Все три части работают параллельно. Если одна упадёт с ошибкой,
     # программа остановится, и ошибка будет видна в логе.

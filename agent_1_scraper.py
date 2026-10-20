@@ -12,16 +12,18 @@ Telethon спросит номер телефона и код из Telegram — 
 """
 
 import asyncio
+import calendar
 import html
 import logging
 import os
 import re
+import time
 
 import aiohttp
 import feedparser
 from telethon import TelegramClient, events
 
-from config import BASE_DIR, TARGET_CHANNELS, TARGET_WEBSITES, TELEGRAM_API_HASH, TELEGRAM_API_ID
+from config import BASE_DIR, KEEP_DAYS, TARGET_CHANNELS, TARGET_WEBSITES, TELEGRAM_API_HASH, TELEGRAM_API_ID
 from database import init_db, message_exists, save_raw_message
 
 logger = logging.getLogger(__name__)
@@ -41,6 +43,19 @@ def clean_html(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def is_too_old(entry):
+    """
+    True, если статья RSS опубликована раньше, чем KEEP_DAYS дней назад.
+    Такие записи удаляются при очистке базы, поэтому сохранять их нельзя —
+    иначе после очистки они придут снова как «новые». Статьи без даты не отбрасываем.
+    """
+    published = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not published:
+        return False
+    # feedparser отдаёт дату в UTC, calendar.timegm превращает её в секунды
+    return calendar.timegm(published) < time.time() - KEEP_DAYS * 86400
+
+
 # ============================================================
 # RSS
 # ============================================================
@@ -54,6 +69,8 @@ async def fetch_feed(session, url):
     feed = feedparser.parse(content)
     new_count = 0
     for entry in feed.entries:
+        if is_too_old(entry):
+            continue
         title = clean_html(entry.get("title", ""))
         summary = clean_html(entry.get("summary", ""))
         link = entry.get("link", "")

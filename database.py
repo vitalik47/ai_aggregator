@@ -271,6 +271,28 @@ def get_user_preferences(user_id):
     return row["topics"] if row and row["topics"] else "all"
 
 
+def clean_old_events(days=7):
+    """
+    Удаляет из raw_messages и events записи старше days дней.
+    Возвращает общее количество удалённых записей.
+    """
+    # timestamp и created_at хранятся в UTC, datetime('now') — тоже UTC
+    period = f"-{days} days"
+    with get_connection() as conn:
+        raw_deleted = conn.execute(
+            "DELETE FROM raw_messages WHERE timestamp < datetime('now', ?)", (period,)
+        ).rowcount
+        events_deleted = conn.execute(
+            "DELETE FROM events WHERE created_at < datetime('now', ?)", (period,)
+        ).rowcount
+    total = raw_deleted + events_deleted
+    logger.info(
+        "Очистка базы (старше %d дн.): удалено сообщений %d, событий %d, всего %d",
+        days, raw_deleted, events_deleted, total,
+    )
+    return total
+
+
 def get_sentiment_stats(tag=None, hours=24):
     """
     Считает, сколько событий каждой тональности было за последние hours часов.

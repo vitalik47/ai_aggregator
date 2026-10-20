@@ -31,6 +31,9 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
 ALLOWED_USER_IDS = [
     int(user_id) for user_id in (os.getenv("ALLOWED_USER_IDS") or "").split(",") if user_id.strip().isdigit()
 ]
+# Сколько дней хранить новости: старше — удаляются при запуске main.py,
+# а статьи RSS старше этого срока сборщик не сохраняет (иначе они вернутся как дубли)
+KEEP_DAYS = 7
 
 # --- Источники новостей ---
 TARGET_WEBSITES = [
