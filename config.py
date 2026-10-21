@@ -34,6 +34,12 @@ ALLOWED_USER_IDS = [
 # Сколько дней хранить новости: старше — удаляются при запуске main.py,
 # а статьи RSS старше этого срока сборщик не сохраняет (иначе они вернутся как дубли)
 KEEP_DAYS = 7
+# Сколько запросов к ИИ (вопросы, /briefing, /digest) в день можно сделать одному пользователю
+_daily_limit = (os.getenv("DAILY_AI_LIMIT") or "").strip()
+DAILY_AI_LIMIT = int(_daily_limit) if _daily_limit.isdigit() else 15
+# Telegram id администратора (команда /stats). Не задан — /stats недоступна никому
+_admin_id = (os.getenv("ADMIN_ID") or "").strip()
+ADMIN_ID = int(_admin_id) if _admin_id.isdigit() else None
 
 # --- Источники новостей ---
 TARGET_WEBSITES = [

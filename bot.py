@@ -10,8 +10,14 @@ Telegram-бот (aiogram 3).
 /defi, /btc, /eth, /sol — 5 последних новостей по теме (по тегам из category_tags)
 /sentiment btc — тональность новостей по теме за 24 часа (без темы — по всем новостям)
 /entity Binance — новости про компанию, человека или проект (поиск по колонке entities)
+/research вопрос — подробный разбор от Агента №4 (agent_4_researcher.py) по новостям за 7 дней
 /settings     — выбор тем (таблица user_preferences); /briefing и /digest учитывают их
+/feedback     — опрос из 3 шагов (FSM), ответы сохраняются в таблицу feedback
+/stats        — статистика (пользователи, запросы к ИИ) — только для ADMIN_ID из .env
 Любой текст   — вопрос Агенту №3
+
+Запросы к ИИ (вопросы, /briefing, /digest, /research и кнопки брифинга/дайджеста) ограничены: DAILY_AI_LIMIT в день
+на пользователя (таблица user_limits).
 
 В /start и /help под справкой есть кнопки (InlineKeyboard) — они делают то же, что команды.
 
@@ -26,17 +32,33 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from agent_3_assistant import answer_question, make_briefing, make_digest
-from config import ALLOWED_USER_IDS, TELEGRAM_BOT_TOKEN
+from agent_4_researcher import research_topic
+from config import ADMIN_ID, ALLOWED_USER_IDS, DAILY_AI_LIMIT, TELEGRAM_BOT_TOKEN
 from database import (
+    check_and_update_limit,
+    get_ai_requests_today,
     get_events_by_entity,
     get_events_by_tag,
+    get_new_users_today,
     get_recent_events,
     get_sentiment_stats,
+    get_total_users,
     get_user_preferences,
     init_db,
+    register_user,
+    save_feedback,
     set_user_preferences,
 )
 
@@ -65,61 +87,98 @@ SENTIMENT_LABELS = {
 HELP_TEXT = (
     "👋 Привет! Я AI Aggregator — собираю крипто-новости из Telegram-каналов и RSS, "
     "фильтрую их с помощью ИИ и отвечаю на вопросы.\n\n"
-    "📰 Новости\n"
+    "📰 Базовые новости\n"
     "/news — последние новости\n"
-    "/top — самые «инсайдерские» новости\n\n"
-    "🤖 Аналитика от ИИ\n"
-    "/briefing — главное за 24 часа и тренд\n"
-    "/digest — короткий дайджест\n\n"
-    "🏷 Новости по темам\n"
+    "/top — самые «инсайдерские» новости\n"
+    "/briefing — главное за 24 часа и тренд (ИИ)\n\n"
+    "🏷 По темам\n"
     "/btc — Bitcoin\n"
     "/eth — Ethereum\n"
     "/sol — Solana\n"
     "/defi — DeFi\n\n"
-    "📊 Настроение рынка\n"
+    "📊 Аналитика\n"
     "/sentiment btc — тональность новостей за 24 часа\n"
-    "(темы: btc, eth, sol, defi; без темы — по всем новостям)\n\n"
-    "🔍 Поиск\n"
+    "(темы: btc, eth, sol, defi; без темы — по всем новостям)\n"
     "/entity Binance — новости про компанию, человека или проект\n"
     "(например: /entity BlackRock, /entity Michael Saylor — имена латиницей)\n\n"
-    "⚙️ Персональные настройки\n"
-    "/settings — выбрать темы для /briefing и /digest\n\n"
-    "❓ Или просто напишите вопрос, например: «Что нового с Bitcoin?»\n\n"
+    "⚙️ Прочее\n"
+    "/digest — короткий дайджест (ИИ)\n"
+    "/research вопрос — подробный разбор от ИИ по новостям за 7 дней\n"
+    "(например: /research Как ETF влияет на биткоин)\n"
+    "/settings — выбрать темы для /briefing и /digest\n"
+    "/feedback — оставить отзыв о боте (3 коротких вопроса)\n"
     "/help — показать эту справку\n\n"
+    "❓ Или просто напишите вопрос, например: «Что нового с Bitcoin?»\n"
+    f"(запросов к ИИ — до {DAILY_AI_LIMIT} в день)\n\n"
     "👇 Или нажмите кнопку:"
 )
+# Этот блок видит в справке только администратор (ADMIN_ID)
+ADMIN_HELP_TEXT = "🔐 Для администратора\n/stats — статистика бота\n\n"
+NO_RIGHTS_TEXT = "У вас нет прав"
 
-# Кнопки под справкой. callback_data — что именно нажали (обрабатывается в on_button)
+# Кнопки под справкой. callback_data — что именно нажали (обрабатывается в on_button).
+# Ряды идут в том же порядке, что и блоки справки
 MENU_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
+    # 1. Базовые новости
     [
         InlineKeyboardButton(text="📰 Новости", callback_data="news"),
         InlineKeyboardButton(text="🕵️ Топ", callback_data="top"),
+        InlineKeyboardButton(text="🔥 Брифинг", callback_data="briefing"),
     ],
-    [
-        InlineKeyboardButton(text="🔥 Брифинг 24ч", callback_data="briefing"),
-        InlineKeyboardButton(text="🤖 Дайджест", callback_data="digest"),
-    ],
+    # 2. По темам
     [
         InlineKeyboardButton(text="₿ BTC", callback_data="tag:btc"),
         InlineKeyboardButton(text="💎 ETH", callback_data="tag:eth"),
         InlineKeyboardButton(text="☀️ SOL", callback_data="tag:sol"),
         InlineKeyboardButton(text="🧪 DeFi", callback_data="tag:defi"),
     ],
+    # 3. Аналитика
     [
-        InlineKeyboardButton(text="📊 Тональность рынка", callback_data="sentiment:"),
+        InlineKeyboardButton(text="📊 Тональность", callback_data="sentiment:"),
+        InlineKeyboardButton(text="🔍 Поиск", callback_data="entity"),
+    ],
+    # 4. Прочее
+    [
+        InlineKeyboardButton(text="🤖 Дайджест", callback_data="digest"),
+        InlineKeyboardButton(text="🧠 Исследование", callback_data="research"),
     ],
     [
-        InlineKeyboardButton(text="📊 BTC", callback_data="sentiment:btc"),
-        InlineKeyboardButton(text="📊 ETH", callback_data="sentiment:eth"),
-        InlineKeyboardButton(text="📊 SOL", callback_data="sentiment:sol"),
-        InlineKeyboardButton(text="📊 DeFi", callback_data="sentiment:defi"),
-    ],
-    [
+        InlineKeyboardButton(text="💬 Обратная связь", callback_data="feedback"),
         InlineKeyboardButton(text="⚙️ Мои темы", callback_data="settings"),
+        InlineKeyboardButton(text="❓ Помощь", callback_data="help"),
     ],
 ])
+# Меню администратора: то же самое + кнопка статистики
+ADMIN_MENU_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=MENU_KEYBOARD.inline_keyboard + [
+    [InlineKeyboardButton(text="📈 Статистика (админ)", callback_data="stats")],
+])
+
+# Кнопки под общей тональностью: та же статистика по отдельной теме
+SENTIMENT_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="📊 BTC", callback_data="sentiment:btc"),
+    InlineKeyboardButton(text="📊 ETH", callback_data="sentiment:eth"),
+    InlineKeyboardButton(text="📊 SOL", callback_data="sentiment:sol"),
+    InlineKeyboardButton(text="📊 DeFi", callback_data="sentiment:defi"),
+]])
+
+ENTITY_HINT_TEXT = (
+    "🔍 Поиск новостей про компанию, человека или проект.\n\n"
+    "Напишите команду и имя латиницей, например:\n"
+    "/entity Binance\n/entity BlackRock\n/entity Michael Saylor"
+)
+
+RESEARCH_HINT_TEXT = (
+    "🧠 Исследование: подробный разбор от ИИ по новостям за последние 7 дней.\n\n"
+    "Напишите команду и вопрос, например:\n"
+    "/research Как ETF влияет на биткоин\n"
+    "/research Что происходит с Solana"
+)
 
 NO_NEWS_TEXT = "Новостей пока нет. Подождите, пока агенты их соберут."
+LIMIT_TEXT = (
+    f"⚠️ Вы достигли дневного лимита бесплатных запросов к ИИ ({DAILY_AI_LIMIT}). "
+    "Лимит обновится завтра. В будущем можно будет оформить подписку для снятия ограничений."
+)
 # Названия месяцев в родительном падеже для даты «20 октября 2026».
 # strftime("%B") зависит от языка Windows, поэтому пишем их сами
 MONTHS = [
@@ -134,9 +193,47 @@ dp = Dispatcher()
 # Вспомогательные функции
 # ============================================================
 
+def is_admin(user_id):
+    return ADMIN_ID is not None and user_id == ADMIN_ID
+
+
 def is_allowed(user_id):
-    """Если задан ALLOWED_USER_IDS — пускаем только этих пользователей."""
-    return not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS
+    """Если задан ALLOWED_USER_IDS — пускаем только этих пользователей (и администратора)."""
+    return not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS or is_admin(user_id)
+
+
+def help_text(user_id):
+    """Справка: администратору дополнительно показываем блок с /stats."""
+    if not is_admin(user_id):
+        return HELP_TEXT
+    footer = "👇 Или нажмите кнопку:"
+    return HELP_TEXT.replace(footer, ADMIN_HELP_TEXT + footer)
+
+
+def menu_keyboard(user_id):
+    return ADMIN_MENU_KEYBOARD if is_admin(user_id) else MENU_KEYBOARD
+
+
+def stats_text():
+    return (
+        "📊 Статистика бота:\n"
+        f"- Всего пользователей: {get_total_users()}\n"
+        f"- Новых сегодня: {get_new_users_today()}\n"
+        f"- Запросов к ИИ сегодня: {get_ai_requests_today()}"
+    )
+
+
+@dp.message.outer_middleware()
+@dp.callback_query.outer_middleware()
+async def track_user(handler, event, data):
+    """Перед любой командой, сообщением или кнопкой отмечаем пользователя в таблице users (для /stats)."""
+    if event.from_user:
+        try:
+            register_user(event.from_user.id)
+        except Exception:
+            # Ошибка учёта не должна мешать ответу пользователю
+            logger.exception("Не удалось записать пользователя %s", event.from_user.id)
+    return await handler(event, data)
 
 
 async def check_access(message: Message):
@@ -182,6 +279,11 @@ def with_time(text):
     # datetime.now() без часового пояса — это время компьютера, где запущен бот
     now = datetime.now()
     return f"📅 {now.day} {MONTHS[now.month - 1]} {now.year}, {now:%H:%M}\n\n{text}"
+
+
+def ai_limit_ok(user_id):
+    """Засчитывает запрос к ИИ. False — дневной лимит исчерпан, к OpenAI обращаться нельзя."""
+    return check_and_update_limit(user_id, DAILY_AI_LIMIT)
 
 
 async def send_long(message: Message, text):
@@ -348,7 +450,18 @@ async def personal_ai_text(action, user_id):
 async def cmd_start(message: Message):
     if not await check_access(message):
         return
-    await message.answer(HELP_TEXT, reply_markup=MENU_KEYBOARD)
+    user_id = message.from_user.id
+    await message.answer(help_text(user_id), reply_markup=menu_keyboard(user_id))
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Статистика бота — только для администратора (ADMIN_ID в .env)."""
+    if not is_admin(message.from_user.id):
+        logger.warning("Попытка открыть /stats: user_id=%s", message.from_user.id)
+        await message.answer(NO_RIGHTS_TEXT)
+        return
+    await message.answer(stats_text())
 
 
 @dp.message(Command("news"))
@@ -369,6 +482,9 @@ async def cmd_top(message: Message):
 async def cmd_digest(message: Message):
     if not await check_access(message):
         return
+    if not ai_limit_ok(message.from_user.id):
+        await message.answer(LIMIT_TEXT)
+        return
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     await send_long(message, await personal_ai_text("digest", message.from_user.id))
 
@@ -377,8 +493,30 @@ async def cmd_digest(message: Message):
 async def cmd_briefing(message: Message):
     # Без check_access: брифинг пока бесплатный и доступен всем
     logger.info("Брифинг для user_id=%s", message.from_user.id)
+    if not ai_limit_ok(message.from_user.id):
+        await message.answer(LIMIT_TEXT)
+        return
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     await send_long(message, await personal_ai_text("briefing", message.from_user.id))
+
+
+@dp.message(Command("research"))
+async def cmd_research(message: Message, command: CommandObject):
+    """/research вопрос — развёрнутый ответ Агента №4 по новостям за 7 дней."""
+    if not await check_access(message):
+        return
+    question = (command.args or "").strip()
+    if not question:
+        # Без вопроса только подсказка — лимит не тратим
+        await message.answer(RESEARCH_HINT_TEXT)
+        return
+    if not ai_limit_ok(message.from_user.id):
+        await message.answer(LIMIT_TEXT)
+        return
+    logger.info("Исследование для user_id=%s: %s", message.from_user.id, question)
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    answer = await research_topic(question)
+    await send_long(message, with_time(f"🧠 Исследование: {question}\n\n{answer}"))
 
 
 @dp.message(Command("settings"))
@@ -414,11 +552,100 @@ async def cmd_entity(message: Message, command: CommandObject):
 
 
 # ============================================================
+# Обратная связь (/feedback): опрос из 3 шагов через FSM
+# ============================================================
+
+class FeedbackForm(StatesGroup):
+    """Шаги опроса. Состояние хранится в памяти бота отдельно для каждого пользователя."""
+    interested = State()   # Шаг 1: интересен ли формат
+    will_pay = State()     # Шаг 2: готов ли платить
+    suggestions = State()  # Шаг 3: что добавить (текст)
+
+
+FEEDBACK_INTERESTED_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="👍 Да", callback_data="fb:interested:yes"),
+    InlineKeyboardButton(text="👎 Нет", callback_data="fb:interested:no"),
+]])
+FEEDBACK_PAY_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="💰 Да", callback_data="fb:pay:yes"),
+    InlineKeyboardButton(text="🆓 Только бесплатно", callback_data="fb:pay:free"),
+]])
+# Ответ в базе -> подпись для пользователя
+FEEDBACK_ANSWER_LABELS = {
+    "interested": {"yes": "👍 Да", "no": "👎 Нет"},
+    "pay": {"yes": "💰 Да", "free": "🆓 Только бесплатно"},
+}
+
+
+async def start_feedback(message: Message, state: FSMContext):
+    """Начинает опрос заново (общая часть для команды /feedback и кнопки в меню)."""
+    await state.clear()
+    await state.set_state(FeedbackForm.interested)
+    await message.answer(
+        "💬 Обратная связь — 3 коротких вопроса.\n\nШаг 1/3. Интересен ли вам формат бота?",
+        reply_markup=FEEDBACK_INTERESTED_KEYBOARD,
+    )
+
+
+async def mark_answer(callback: CallbackQuery, answer_text):
+    """Убирает кнопки у вопроса и дописывает выбранный ответ — чтобы нельзя было нажать дважды."""
+    await callback.answer()
+    try:
+        await callback.message.edit_text(f"{callback.message.text}\n\nВаш ответ: {answer_text}")
+    except TelegramBadRequest:
+        pass
+
+
+@dp.message(Command("feedback"))
+async def cmd_feedback(message: Message, state: FSMContext):
+    # Без check_access: отзыв может оставить любой
+    await start_feedback(message, state)
+
+
+@dp.callback_query(FeedbackForm.interested, F.data.in_({"fb:interested:yes", "fb:interested:no"}))
+async def feedback_interested(callback: CallbackQuery, state: FSMContext):
+    """Шаг 1 -> 2: сохраняем ответ ("yes"/"no") и спрашиваем про оплату."""
+    answer = callback.data.split(":")[-1]
+    await mark_answer(callback, FEEDBACK_ANSWER_LABELS["interested"][answer])
+    await state.update_data(is_interested=answer)
+    await state.set_state(FeedbackForm.will_pay)
+    await callback.message.answer(
+        "Шаг 2/3. Готовы ли вы платить 5$ в месяц за подписку?", reply_markup=FEEDBACK_PAY_KEYBOARD
+    )
+
+
+@dp.callback_query(FeedbackForm.will_pay, F.data.in_({"fb:pay:yes", "fb:pay:free"}))
+async def feedback_will_pay(callback: CallbackQuery, state: FSMContext):
+    """Шаг 2 -> 3: сохраняем ответ ("yes"/"free") и просим написать пожелания."""
+    answer = callback.data.split(":")[-1]
+    await mark_answer(callback, FEEDBACK_ANSWER_LABELS["pay"][answer])
+    await state.update_data(will_pay=answer)
+    await state.set_state(FeedbackForm.suggestions)
+    await callback.message.answer("Шаг 3/3. Что бы вы хотели добавить или изменить? Напишите одним сообщением.")
+
+
+@dp.callback_query(F.data.startswith("fb:"))
+async def feedback_old_button(callback: CallbackQuery):
+    """Нажали кнопку из старого или уже пройденного опроса."""
+    await callback.answer("Этот опрос уже неактивен. Начните заново: /feedback", show_alert=True)
+
+
+# Команды (/news и др.) во время шага 3 обрабатываются как обычно — их обработчики стоят выше.
+# Неизвестные команды тоже не считаем ответом
+@dp.message(FeedbackForm.suggestions, F.text, ~F.text.startswith("/"))
+async def feedback_suggestions(message: Message, state: FSMContext):
+    data = await state.get_data()
+    save_feedback(message.from_user.id, data["is_interested"], data["will_pay"], message.text.strip())
+    await state.clear()
+    await message.answer("Спасибо! Ваше мнение очень важно для нас. 🙏")
+
+
+# ============================================================
 # Кнопки (InlineKeyboard под /start и /help)
 # ============================================================
 
 @dp.callback_query(F.data)
-async def on_button(callback: CallbackQuery):
+async def on_button(callback: CallbackQuery, state: FSMContext):
     """Нажатие кнопки: callback_data вида "news", "tag:btc", "sentiment:eth", "topic:bitcoin"."""
     action, _, arg = callback.data.partition(":")
     user_id = callback.from_user.id
@@ -438,8 +665,17 @@ async def on_button(callback: CallbackQuery):
             pass
         return
 
-    # Брифинг и настройки тем доступны всем, как и команды /briefing и /settings
-    if action not in ("briefing", "settings") and not is_allowed(user_id):
+    # Статистика — только администратору
+    if action == "stats":
+        if not is_admin(user_id):
+            await callback.answer(NO_RIGHTS_TEXT, show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.answer(stats_text())
+        return
+
+    # Брифинг, настройки тем и отзыв доступны всем, как и команды /briefing, /settings и /feedback
+    if action not in ("briefing", "settings", "feedback") and not is_allowed(user_id):
         logger.warning("Отказано в доступе (кнопка): user_id=%s", callback.from_user.id)
         await callback.answer(f"Доступ закрыт. Ваш Telegram id: {callback.from_user.id}", show_alert=True)
         return
@@ -456,8 +692,27 @@ async def on_button(callback: CallbackQuery):
     elif action == "tag" and arg in TAG_COMMANDS:
         text = tag_text(arg)
     elif action == "sentiment":
+        if not arg:
+            # Общая тональность + кнопки, чтобы посмотреть её по каждой теме
+            await message.answer(sentiment_text(""), reply_markup=SENTIMENT_KEYBOARD)
+            return
         text = sentiment_text(arg)
+    elif action == "entity":
+        # Имя для поиска кнопкой не передать — подсказываем, как написать команду
+        text = ENTITY_HINT_TEXT
+    elif action == "research":
+        # Вопрос кнопкой не передать — подсказываем, как написать команду
+        text = RESEARCH_HINT_TEXT
+    elif action == "feedback":
+        await start_feedback(message, state)
+        return
+    elif action == "help":
+        await message.answer(help_text(user_id), reply_markup=menu_keyboard(user_id))
+        return
     elif action in ("briefing", "digest"):
+        if not ai_limit_ok(user_id):
+            await message.answer(LIMIT_TEXT)
+            return
         await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
         text = await personal_ai_text(action, user_id)
     elif action == "settings":
@@ -476,6 +731,9 @@ async def handle_question(message: Message):
     """Любой обычный текст считаем вопросом к ассистенту."""
     if not await check_access(message):
         return
+    if not ai_limit_ok(message.from_user.id):
+        await message.answer(LIMIT_TEXT)
+        return
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     await send_long(message, await answer_question(message.text))
 
@@ -489,10 +747,10 @@ async def run_bot():
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
     # Подсказки команд в меню Telegram
-    await bot.set_my_commands([
+    commands = [
+        # Тот же порядок, что в справке /help
         BotCommand(command="news", description="Последние новости"),
         BotCommand(command="top", description="Самые инсайдерские новости"),
-        BotCommand(command="digest", description="Дайджест от ИИ"),
         BotCommand(command="briefing", description="Главное за 24 часа"),
         BotCommand(command="btc", description="Новости Bitcoin"),
         BotCommand(command="eth", description="Новости Ethereum"),
@@ -500,9 +758,24 @@ async def run_bot():
         BotCommand(command="defi", description="Новости DeFi"),
         BotCommand(command="sentiment", description="Тональность за 24 часа: /sentiment btc"),
         BotCommand(command="entity", description="Поиск по имени: /entity Binance"),
+        BotCommand(command="digest", description="Дайджест от ИИ"),
+        BotCommand(command="research", description="Разбор от ИИ: /research вопрос"),
         BotCommand(command="settings", description="Мои темы для брифинга и дайджеста"),
+        BotCommand(command="feedback", description="Оставить отзыв о боте"),
         BotCommand(command="help", description="Справка"),
-    ])
+    ]
+    await bot.set_my_commands(commands)
+
+    # Администратору в его чате с ботом дополнительно показываем /stats
+    if ADMIN_ID:
+        try:
+            await bot.set_my_commands(
+                commands + [BotCommand(command="stats", description="Статистика бота (админ)")],
+                scope=BotCommandScopeChat(chat_id=ADMIN_ID),
+            )
+        except TelegramBadRequest:
+            # Например, администратор ещё ни разу не писал боту
+            logger.warning("Не удалось показать /stats в меню администратора (ADMIN_ID=%s)", ADMIN_ID)
 
     if not ALLOWED_USER_IDS:
         logger.warning("ALLOWED_USER_IDS не задан — ботом может пользоваться кто угодно")

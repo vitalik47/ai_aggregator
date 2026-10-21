@@ -4,11 +4,16 @@
 Таблицы:
 - raw_messages — «сырые» сообщения от Агента №1 (сборщика)
 - events       — отфильтрованные события от Агента №2 (фильтра)
+- user_preferences — темы пользователей бота (/settings)
+- user_limits  — дневной лимит запросов к ИИ для каждого пользователя
+- feedback     — ответы пользователей на опрос /feedback
+- users        — все пользователи бота и дата первого визита (для /stats)
 """
 
 import logging
 import sqlite3
 from contextlib import contextmanager
+from datetime import date
 
 from config import DATABASE_PATH
 
@@ -84,6 +89,52 @@ def init_db():
             )
             """
         )
+
+        # Дневной лимит запросов к ИИ: сколько запросов сделал пользователь и в какой день
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_limits (
+                user_id INTEGER PRIMARY KEY,
+                request_count INTEGER DEFAULT 0,
+                last_request_date DATE
+            )
+            """
+        )
+
+        # Ответы на опрос /feedback.
+        # is_interested: "yes" / "no"; will_pay: "yes" / "free" (только бесплатно)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                is_interested TEXT,
+                will_pay TEXT,
+                suggestions TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        # Все, кто хоть раз писал боту или нажимал кнопку (для /stats).
+        # first_seen и last_seen — в UTC, как created_at в events
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        # Пользователей, которые были до появления таблицы users, переносим из других таблиц.
+        # Когда они пришли впервые — неизвестно, поэтому first_seen = NULL (в «новых сегодня» не попадут).
+        # Эти таблицы уже созданы выше
+        for table in ["user_limits", "user_preferences", "feedback"]:
+            conn.execute(
+                f"INSERT OR IGNORE INTO users (user_id, first_seen, last_seen) "
+                f"SELECT DISTINCT user_id, NULL, NULL FROM {table} WHERE user_id IS NOT NULL"
+            )
     logger.info("База данных инициализирована: %s", DATABASE_PATH)
 
 
@@ -226,6 +277,22 @@ def get_events_by_entity(entity_name, limit=10):
     return events
 
 
+def get_events_since(days=7):
+    """Все события за последние days дней, от новых к старым."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM events
+            WHERE created_at >= datetime('now', ?)
+            ORDER BY created_at DESC, id DESC
+            """,
+            (f"-{days} days",),
+        ).fetchall()
+    events = [dict(row) for row in rows]
+    logger.debug("Событий за %d дн.: %d", days, len(events))
+    return events
+
+
 def get_events_by_topics(topics_list, hours=24, limit=50):
     """Новости за последние hours часов, у которых есть хотя бы один тег из topics_list."""
     if not topics_list:
@@ -291,6 +358,94 @@ def clean_old_events(days=7):
         days, raw_deleted, events_deleted, total,
     )
     return total
+
+
+def check_and_update_limit(user_id, limit):
+    """
+    Проверяет дневной лимит запросов к ИИ и засчитывает новый запрос.
+    True — запрос можно делать (счётчик уже увеличен), False — лимит на сегодня исчерпан.
+    Новый день (или первая запись) — счётчик начинается заново с 1.
+    """
+    # Дата по часам компьютера, где запущен бот: лимит обновляется в местную полночь
+    today = date.today().isoformat()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT request_count, last_request_date FROM user_limits WHERE user_id = ?", (user_id,)
+        ).fetchone()
+
+        if row is None or row["last_request_date"] != today:
+            count = 1
+        elif row["request_count"] < limit:
+            count = row["request_count"] + 1
+        else:
+            logger.info("Лимит ИИ исчерпан: user_id=%s (%d/%d)", user_id, row["request_count"], limit)
+            return False
+
+        conn.execute(
+            """
+            INSERT INTO user_limits (user_id, request_count, last_request_date) VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                request_count = excluded.request_count,
+                last_request_date = excluded.last_request_date
+            """,
+            (user_id, count, today),
+        )
+    logger.info("Запрос к ИИ: user_id=%s (%d/%d)", user_id, count, limit)
+    return True
+
+
+def save_feedback(user_id, is_interested, will_pay, suggestions):
+    """
+    Сохраняет ответ на опрос /feedback. Возвращает id записи.
+    is_interested — "yes" или "no", will_pay — "yes" или "free".
+    """
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "INSERT INTO feedback (user_id, is_interested, will_pay, suggestions) VALUES (?, ?, ?, ?)",
+            (user_id, is_interested, will_pay, suggestions),
+        )
+        new_id = cursor.lastrowid
+    logger.info(
+        "Отзыв id=%s от user_id=%s: интересно=%s, платить=%s", new_id, user_id, is_interested, will_pay
+    )
+    return new_id
+
+
+def register_user(user_id):
+    """Отмечает визит пользователя: новый — добавляется, у старого обновляется last_seen."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (user_id) VALUES (?)
+            ON CONFLICT(user_id) DO UPDATE SET last_seen = CURRENT_TIMESTAMP
+            """,
+            (user_id,),
+        )
+
+
+def get_total_users():
+    """Сколько всего уникальных пользователей было у бота."""
+    with get_connection() as conn:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def get_new_users_today():
+    """Сколько пользователей впервые появились сегодня (сегодня — по часам этого компьютера)."""
+    # first_seen в UTC, 'localtime' переводит его в местное время перед сравнением дат
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM users WHERE date(first_seen, 'localtime') = date('now', 'localtime')"
+        ).fetchone()[0]
+
+
+def get_ai_requests_today():
+    """Сколько запросов к ИИ сделали все пользователи сегодня (по таблице user_limits)."""
+    # Счётчик в user_limits сбрасывается каждый день, поэтому берём только записи с сегодняшней датой
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COALESCE(SUM(request_count), 0) FROM user_limits WHERE last_request_date = ?",
+            (date.today().isoformat(),),
+        ).fetchone()[0]
 
 
 def get_sentiment_stats(tag=None, hours=24):
