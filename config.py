@@ -41,6 +41,22 @@ DAILY_AI_LIMIT = int(_daily_limit) if _daily_limit.isdigit() else 15
 _admin_id = (os.getenv("ADMIN_ID") or "").strip()
 ADMIN_ID = int(_admin_id) if _admin_id.isdigit() else None
 
+# --- Теория DeFi (/theory): главы, из которых GPT выбирает 3 самые подходящие к вопросу ---
+THEORY_CHAPTERS = [
+    "Основы блокчейна и смарт-контрактов",
+    "Кошельки, ключи и безопасность",
+    "Стейблкоины",
+    "Децентрализованные биржи (DEX) и AMM",
+    "Пулы ликвидности и impermanent loss",
+    "Лендинг и заимствования",
+    "Стейкинг и ликвидный стейкинг",
+    "Доходное фермерство (yield farming)",
+    "Оракулы",
+    "Layer 2 и мосты между сетями",
+    "Токеномика и управление (DAO)",
+    "Риски DeFi: взломы, ликвидации, rug pull",
+]
+
 # --- Источники новостей ---
 TARGET_WEBSITES = [
     "https://cointelegraph.com/rss",

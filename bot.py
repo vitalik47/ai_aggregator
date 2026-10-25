@@ -545,7 +545,9 @@ async def cmd_news(message: Message):
 async def cmd_top(message: Message):
     if not await check_access(message):
         return
-    await send_long(message, top_text())
+    text = top_text()
+    remember_context(message.from_user.id, text)
+    await send_long(message, text)
 
 
 @dp.message(Command("digest"))
@@ -556,7 +558,9 @@ async def cmd_digest(message: Message):
         await message.answer(LIMIT_TEXT)
         return
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    await send_long(message, await personal_ai_text("digest", message.from_user.id))
+    text = await personal_ai_text("digest", message.from_user.id)
+    remember_context(message.from_user.id, text)
+    await send_long(message, text)
 
 
 @dp.message(Command("briefing"))
@@ -734,15 +738,39 @@ THEORY_FIRST_TOPIC_TEXT = (
 )
 THEORY_OLD_BUTTON_TEXT = "Этот выбор уже неактивен. Начните заново: /theory"
 
-# Кнопки под объяснением темы
-THEORY_ANSWER_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[[
-    InlineKeyboardButton(text="📖 Читаем", callback_data="theory_read"),
-    InlineKeyboardButton(text="🔄 Другое", callback_data="other_topic"),
-]])
-# Кнопка под главами
+# Кнопка под главами и под объяснением без подходящих глав
 THEORY_CHAPTERS_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="🔄 Другая тема", callback_data="other_topic"),
 ]])
+
+
+def lesson_keyboard(lesson_id, chapters):
+    """
+    Под объяснением: по кнопке на каждую главу, ниже — «Читаем» (все главы) и «Другое».
+    lesson_id в callback_data — чтобы кнопки старого объяснения не открыли главы нового.
+    """
+    if not chapters:
+        return THEORY_CHAPTERS_KEYBOARD
+    rows = [
+        [InlineKeyboardButton(text=f"📖 {i}. {name}", callback_data=f"theory_chapter:{lesson_id}:{i - 1}")]
+        for i, name in enumerate(chapters, start=1)
+    ]
+    rows.append([
+        InlineKeyboardButton(text="📖 Читаем", callback_data=f"theory_read:{lesson_id}"),
+        InlineKeyboardButton(text="🔄 Другое", callback_data="other_topic"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def lesson_text(topic, lesson):
+    """Объяснение + список глав."""
+    text = f"📚 Теория DeFi: {topic}\n\n{lesson['explanation']}"
+    if lesson["chapters"]:
+        lines = "\n".join(f"{i}. {name}" for i, name in enumerate(lesson["chapters"], start=1))
+        text += f"\n\n📖 Главы для изучения:\n{lines}\n\nНажмите на главу или «Читаем» — все главы сразу."
+    else:
+        text += "\n\nПодходящих глав по этой теме нет. Можно задать другую тему."
+    return text
 
 
 def suggestions_keyboard(terms):
@@ -783,25 +811,24 @@ async def ask_theory_topic(message: Message, state: FSMContext, text=THEORY_ASK_
 async def start_theory(message: Message, user_id, state: FSMContext):
     """Начало «Теории DeFi» (команда /theory и кнопка в меню): термины из last_context или ручной ввод."""
     context = get_last_context(user_id)
-    data = await state.get_data()
+    # Номер урока сохраняем: по нему отличаем кнопки старых объяснений от новых
+    lesson_id = (await state.get_data()).get("theory_lesson_id", 0)
     # Заодно прерывает опрос /feedback, если он был начат
     await state.clear()
+    await state.update_data(theory_lesson_id=lesson_id)
+    logger.info("Теория для user_id=%s: last_context %d символов", user_id, len(context))
     if not context:
         await ask_theory_topic(message, state, THEORY_FIRST_TOPIC_TEXT)
         return
 
-    # Для этого же текста термины уже подбирали — не тратим повторный запрос к GPT
-    if data.get("theory_context") == context and data.get("theory_terms"):
-        terms = data["theory_terms"]
-    else:
-        await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-        terms = await suggest_topics_from_context(context)
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    terms = await suggest_topics_from_context(context)
     if not terms:
         # GPT не нашёл терминов или не ответил — просим тему вручную
         await ask_theory_topic(message, state, THEORY_FIRST_TOPIC_TEXT)
         return
 
-    await state.update_data(theory_context=context, theory_terms=terms)
+    await state.update_data(theory_terms=terms)
     await state.set_state(TheoryStates.waiting_for_suggestion_choice)
     lines = "\n".join(f"{i}. {term}" for i, term in enumerate(terms, start=1))
     await message.answer(
@@ -812,19 +839,55 @@ async def start_theory(message: Message, user_id, state: FSMContext):
 
 
 async def send_theory(message: Message, user_id, state: FSMContext, topic):
-    """Объяснение темы (3-4 предложения + план из 3 глав) с кнопками «Читаем» / «Другое»."""
+    """Объяснение темы (3 предложения) + до 3 глав кнопками, «Читаем» и «Другое»."""
     if not ai_limit_ok(user_id):
         await message.answer(LIMIT_TEXT)
         return
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    text = await explain_topic(topic)
-    # Выходим из шагов FSM, но данные оставляем: «Читаем» берёт из них тему и план
+    lesson, error = await explain_topic(topic)
+    if error:
+        # Ждём тему снова — пользователь может просто написать её ещё раз
+        await state.set_state(TheoryStates.waiting_for_topic)
+        await message.answer(error)
+        return
+    # Выходим из шагов FSM, но данные оставляем: кнопки глав берут из них тему и главы
     await state.set_state(None)
+    lesson_id = (await state.get_data()).get("theory_lesson_id", 0) + 1
+    await state.update_data(theory_lesson_id=lesson_id, theory_topic=topic, theory_lesson=lesson)
+    await send_long(
+        message, with_time(lesson_text(topic, lesson)), reply_markup=lesson_keyboard(lesson_id, lesson["chapters"])
+    )
+
+
+async def current_lesson(callback: CallbackQuery, state: FSMContext):
+    """
+    Урок, к которому относится кнопка (theory_read:<id> или theory_chapter:<id>:<n>).
+    Кнопка от старого объяснения или после перезапуска бота -> None и всплывающее сообщение.
+    """
+    data = await state.get_data()
+    parts = callback.data.split(":")
+    lesson = data.get("theory_lesson")
+    if not lesson or not lesson["chapters"] or parts[1] != str(data.get("theory_lesson_id")):
+        await callback.answer(THEORY_OLD_BUTTON_TEXT, show_alert=True)
+        return None
+    return data["theory_topic"], lesson
+
+
+async def send_chapters(callback: CallbackQuery, topic, lesson, chapters, first_number, reply_markup):
+    """Пишет главы (тратит запрос к ИИ) и отправляет их с кнопками reply_markup."""
+    await callback.answer()
+    user_id = callback.from_user.id
+    message = callback.message
+    if not ai_limit_ok(user_id):
+        await message.answer(LIMIT_TEXT)
+        return
+    await remove_buttons(callback)
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    text = await read_chapters(topic, lesson["explanation"], chapters, first_number)
     if text == ERROR_TEXT:
         await message.answer(text)
         return
-    await state.update_data(theory_topic=topic, theory_plan=text)
-    await send_long(message, with_time(f"📚 Теория DeFi: {topic}\n\n{text}"), reply_markup=THEORY_ANSWER_KEYBOARD)
+    await send_long(message, text, reply_markup=reply_markup)
 
 
 @dp.message(Command("theory"))
@@ -868,35 +931,41 @@ async def theory_pick_term(callback: CallbackQuery, state: FSMContext):
     await send_theory(callback.message, callback.from_user.id, state, terms[int(index)])
 
 
-@dp.callback_query(F.data.in_({"read_suggested"}) | F.data.startswith("theory_term:"))
+# "theory_read" без номера урока — кнопка из сообщений, отправленных прошлой версией бота
+@dp.callback_query(F.data.in_({"read_suggested", "theory_read"}) | F.data.startswith("theory_term:"))
 async def theory_old_suggestion(callback: CallbackQuery):
     """Нажали термин из старого списка (уже выбрали другой вариант или бот перезапускался)."""
     await callback.answer(THEORY_OLD_BUTTON_TEXT, show_alert=True)
 
 
-@dp.callback_query(F.data == "theory_read")
+@dp.callback_query(F.data.startswith("theory_read:"))
 async def theory_read(callback: CallbackQuery, state: FSMContext):
-    """«📖 Читаем»: три главы по плану из последнего объяснения."""
+    """«📖 Читаем»: все главы из последнего объяснения."""
     if not await callback_allowed(callback):
         return
-    data = await state.get_data()
-    topic, plan = data.get("theory_topic"), data.get("theory_plan")
-    if not topic or not plan:
+    found = await current_lesson(callback, state)
+    if not found:
+        return
+    topic, lesson = found
+    await send_chapters(callback, topic, lesson, lesson["chapters"], 1, THEORY_CHAPTERS_KEYBOARD)
+
+
+@dp.callback_query(F.data.startswith("theory_chapter:"))
+async def theory_chapter(callback: CallbackQuery, state: FSMContext):
+    """Одна глава: theory_chapter:<урок>:0 — первая. Под ней снова кнопки глав, чтобы читать дальше."""
+    if not await callback_allowed(callback):
+        return
+    found = await current_lesson(callback, state)
+    if not found:
+        return
+    topic, lesson = found
+    index = callback.data.split(":")[-1]
+    if not index.isdigit() or int(index) >= len(lesson["chapters"]):
         await callback.answer(THEORY_OLD_BUTTON_TEXT, show_alert=True)
         return
-    await callback.answer()
-    user_id = callback.from_user.id
-    message = callback.message
-    if not ai_limit_ok(user_id):
-        await message.answer(LIMIT_TEXT)
-        return
-    await remove_buttons(callback)
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    text = await read_chapters(topic, plan)
-    if text == ERROR_TEXT:
-        await message.answer(text)
-        return
-    await send_long(message, text, reply_markup=THEORY_CHAPTERS_KEYBOARD)
+    index = int(index)
+    keyboard = lesson_keyboard(callback.data.split(":")[1], lesson["chapters"])
+    await send_chapters(callback, topic, lesson, [lesson["chapters"][index]], index + 1, keyboard)
 
 
 @dp.callback_query(F.data == "other_topic")
@@ -1009,8 +1078,8 @@ async def on_button(callback: CallbackQuery, state: FSMContext):
         logger.warning("Неизвестная кнопка: %s", callback.data)
         return
 
-    # Как и у команд /news и /briefing — запоминаем текст для /theory
-    if action in ("news", "briefing"):
+    # Как и у команд — запоминаем текст для /theory
+    if action in ("news", "top", "briefing", "digest"):
         remember_context(user_id, text)
     await send_long(message, text)
 
@@ -1024,7 +1093,9 @@ async def handle_question(message: Message):
         await message.answer(LIMIT_TEXT)
         return
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    await send_long(message, await answer_question(message.text))
+    answer = await answer_question(message.text)
+    remember_context(message.from_user.id, answer)
+    await send_long(message, answer)
 
 
 # ============================================================

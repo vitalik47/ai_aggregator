@@ -78,14 +78,20 @@ def format_events(events):
     return "\n".join(lines)
 
 
-async def ask_gpt(system_prompt, user_text):
-    """Один запрос к GPT. Возвращает текст ответа."""
+async def ask_gpt(system_prompt, user_text, json_mode=False):
+    """
+    Один запрос к GPT. Возвращает текст ответа.
+    json_mode=True — GPT обязан вернуть JSON-объект (в промпте должно быть слово JSON).
+    """
+    # Без json_mode параметр не передаём вовсе — запрос остаётся таким же, как раньше
+    extra = {"response_format": {"type": "json_object"}} if json_mode else {}
     response = await client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
+        **extra,
     )
     return response.choices[0].message.content.strip()
 
