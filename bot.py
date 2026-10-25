@@ -4,13 +4,15 @@ Telegram-бот (aiogram 3).
 Команды:
 /start, /help — справка
 /news         — последние события из базы (без GPT, бесплатно)
-/top          — события с самым высоким insider_score
+/top          — 5 событий с самым высоким insider_score (DeFi-новости получают бонус DEFI_PRIORITY_BONUS)
 /digest       — дайджест от Агента №3
 /briefing     — главное за 24 часа (доступна всем, даже при ALLOWED_USER_IDS)
 /defi, /btc, /eth, /sol — 5 последних новостей по теме (по тегам из category_tags)
 /sentiment btc — тональность новостей по теме за 24 часа (без темы — по всем новостям)
-/entity Binance — новости про компанию, человека или проект (поиск по колонке entities)
-/research вопрос — подробный разбор от Агента №4 (agent_4_researcher.py) по новостям за 7 дней
+/entity AAVE  — новости про актив; только тикеры из ALLOWED_ENTITIES (поиск по колонке entities)
+/research вопрос — подробный разбор от Агента №4 (agent_4_researcher.py) по новостям за 7 дней,
+                   вопрос не длиннее MAX_RESEARCH_LENGTH символов
+/theory       — «Теория DeFi» от Агента №5: термины из последнего ответа (users.last_context) или своя тема (FSM)
 /settings     — выбор тем (таблица user_preferences); /briefing и /digest учитывают их
 /feedback     — опрос из 3 шагов (FSM), ответы сохраняются в таблицу feedback
 /stats        — статистика (пользователи, запросы к ИИ) — только для ADMIN_ID из .env
@@ -31,7 +33,7 @@ from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -43,14 +45,16 @@ from aiogram.types import (
     Message,
 )
 
-from agent_3_assistant import answer_question, make_briefing, make_digest
+from agent_3_assistant import ERROR_TEXT, answer_question, make_briefing, make_digest
 from agent_4_researcher import research_topic
+from agent_5_teacher import explain_topic, read_chapters, suggest_topics_from_context
 from config import ADMIN_ID, ALLOWED_USER_IDS, DAILY_AI_LIMIT, TELEGRAM_BOT_TOKEN
 from database import (
     check_and_update_limit,
     get_ai_requests_today,
     get_events_by_entity,
     get_events_by_tag,
+    get_last_context,
     get_new_users_today,
     get_recent_events,
     get_sentiment_stats,
@@ -59,6 +63,7 @@ from database import (
     init_db,
     register_user,
     save_feedback,
+    save_last_context,
     set_user_preferences,
 )
 
@@ -83,47 +88,71 @@ SENTIMENT_LABELS = {
     "negative": ("🔴", "Негатив"),
     "neutral": ("⚪", "Нейтрально"),
 }
+# Теги, которые считаем DeFi. Сейчас Агент №2 ставит только "defi", остальные — на будущее
+DEFI_TAGS = {"defi", "dex", "yield", "liquidity"}
+# Сколько баллов добавлять к insider_score DeFi-новостей при выборе /top
+DEFI_PRIORITY_BONUS = 1
+# /entity: тикер -> имя, под которым Агент №2 записывает актив в колонку entities
+ENTITY_NAMES = {
+    "BTC": "Bitcoin", "ETH": "Ethereum", "SOL": "Solana", "BNB": "BNB", "XRP": "XRP",
+    "ADA": "Cardano", "AVAX": "Avalanche", "DOT": "Polkadot", "LINK": "Chainlink", "MATIC": "Polygon",
+    "UNI": "Uniswap", "AAVE": "Aave", "LDO": "Lido", "ARB": "Arbitrum", "OP": "Optimism",
+}
+ALLOWED_ENTITIES = list(ENTITY_NAMES)
+ENTITY_NOT_ALLOWED_TEXT = (
+    "Пока я не ищу по этому активу. Доступные тикеры: "
+    + ", ".join(ALLOWED_ENTITIES)
+    + ". Пример: /entity AAVE"
+)
+# /research: вопросы длиннее этого не отправляем в ИИ
+MAX_RESEARCH_LENGTH = 300
+RESEARCH_TOO_LONG_TEXT = (
+    f"Ваш запрос слишком длинный. Пожалуйста, сократите его до {MAX_RESEARCH_LENGTH} символов, "
+    "чтобы ИИ мог дать точный ответ."
+)
+
+# Список команд — общий для /start и /help
+COMMANDS_TEXT = (
+    "🧠 /briefing — Главные события за 24 часа (общий срез рынка)\n"
+    "🎯 /top — Топ-5 новостей, которые сильнее всего влияют на рынок (с акцентом на DeFi)\n"
+    f"🔍 /entity — Инфо по конкретной монете. Доступно {len(ALLOWED_ENTITIES)} активов (напр. /entity AAVE)\n"
+    "🕵️‍♂️ /research — Задай любой вопрос по крипте (напр. /research Что с Ethereum?)\n"
+    "📚 /theory — Теория DeFi: объясню сложные термины из последней новости простыми словами\n"
+    "📰 /news — Последние новости без ИИ-обработки\n"
+    "📊 /sentiment — Настроение рынка по конкретной монете\n"
+    "⚙️ /settings — Настроить темы (DeFi, NFT и т.д.)\n\n"
+    "❓ Или просто напишите вопрос, например: «Что нового с Bitcoin?»\n"
+    f"(запросов к ИИ — до {DAILY_AI_LIMIT} в день)"
+)
+
+# Приветствие на /start: коротко про бота + список команд
+START_TEXT = (
+    "Привет! Я — Crypto Brief 42, твой ИИ-аналитик.\n"
+    "Я не просто собираю новости, я их читаю, анализирую и делаю выводы за тебя.\n\n"
+    f"{COMMANDS_TEXT}\n\n"
+    "👇 Или выбери ИИ-функцию ниже:"
+)
 
 HELP_TEXT = (
-    "👋 Привет! Я AI Aggregator — собираю крипто-новости из Telegram-каналов и RSS, "
-    "фильтрую их с помощью ИИ и отвечаю на вопросы.\n\n"
-    "📰 Базовые новости\n"
-    "/news — последние новости\n"
-    "/top — самые «инсайдерские» новости\n"
-    "/briefing — главное за 24 часа и тренд (ИИ)\n\n"
-    "🏷 По темам\n"
-    "/btc — Bitcoin\n"
-    "/eth — Ethereum\n"
-    "/sol — Solana\n"
-    "/defi — DeFi\n\n"
-    "📊 Аналитика\n"
-    "/sentiment btc — тональность новостей за 24 часа\n"
-    "(темы: btc, eth, sol, defi; без темы — по всем новостям)\n"
-    "/entity Binance — новости про компанию, человека или проект\n"
-    "(например: /entity BlackRock, /entity Michael Saylor — имена латиницей)\n\n"
-    "⚙️ Прочее\n"
-    "/digest — короткий дайджест (ИИ)\n"
-    "/research вопрос — подробный разбор от ИИ по новостям за 7 дней\n"
-    "(например: /research Как ETF влияет на биткоин)\n"
-    "/settings — выбрать темы для /briefing и /digest\n"
-    "/feedback — оставить отзыв о боте (3 коротких вопроса)\n"
-    "/help — показать эту справку\n\n"
-    "❓ Или просто напишите вопрос, например: «Что нового с Bitcoin?»\n"
-    f"(запросов к ИИ — до {DAILY_AI_LIMIT} в день)\n\n"
+    "📖 Справка Crypto Brief 42:\n\n"
+    f"{COMMANDS_TEXT}\n\n"
     "👇 Или нажмите кнопку:"
 )
 # Этот блок видит в справке только администратор (ADMIN_ID)
 ADMIN_HELP_TEXT = "🔐 Для администратора\n/stats — статистика бота\n\n"
 NO_RIGHTS_TEXT = "У вас нет прав"
 
-# Кнопки под справкой. callback_data — что именно нажали (обрабатывается в on_button).
+# Кнопки под /start и /help. callback_data — что именно нажали (обрабатывается в on_button).
+# Тексты кнопок можно менять свободно, а callback_data — нет: по ним работает on_button.
 # Ряды идут в том же порядке, что и блоки справки
 MENU_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
-    # 1. Базовые новости
+    # 1. Главное от ИИ + обычная лента
     [
-        InlineKeyboardButton(text="📰 Новости", callback_data="news"),
-        InlineKeyboardButton(text="🕵️ Топ", callback_data="top"),
-        InlineKeyboardButton(text="🔥 Брифинг", callback_data="briefing"),
+        InlineKeyboardButton(text="🧠 ИИ-дайджест", callback_data="briefing"),
+        InlineKeyboardButton(text="🎯 Топ-тренды (DeFi)", callback_data="top"),
+    ],
+    [
+        InlineKeyboardButton(text="📰 Просто новости", callback_data="news"),
     ],
     # 2. По темам
     [
@@ -132,19 +161,22 @@ MENU_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
         InlineKeyboardButton(text="☀️ SOL", callback_data="tag:sol"),
         InlineKeyboardButton(text="🧪 DeFi", callback_data="tag:defi"),
     ],
-    # 3. Аналитика
+    # 3. ИИ-аналитика
     [
-        InlineKeyboardButton(text="📊 Тональность", callback_data="sentiment:"),
-        InlineKeyboardButton(text="🔍 Поиск", callback_data="entity"),
+        InlineKeyboardButton(text="📊 ИИ: Настроение рынка", callback_data="sentiment:"),
+        InlineKeyboardButton(text="🔍 Инфо по монете", callback_data="entity"),
     ],
     # 4. Прочее
     [
-        InlineKeyboardButton(text="🤖 Дайджест", callback_data="digest"),
-        InlineKeyboardButton(text="🧠 Исследование", callback_data="research"),
+        InlineKeyboardButton(text="📝 ИИ: Краткая сводка", callback_data="digest"),
+        InlineKeyboardButton(text="🔬 ИИ: Исследование", callback_data="research"),
     ],
     [
-        InlineKeyboardButton(text="💬 Обратная связь", callback_data="feedback"),
-        InlineKeyboardButton(text="⚙️ Мои темы", callback_data="settings"),
+        InlineKeyboardButton(text="📚 Теория DeFi", callback_data="theory"),
+    ],
+    [
+        InlineKeyboardButton(text="💬 Фидбек", callback_data="feedback"),
+        InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"),
         InlineKeyboardButton(text="❓ Помощь", callback_data="help"),
     ],
 ])
@@ -162,13 +194,13 @@ SENTIMENT_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[[
 ]])
 
 ENTITY_HINT_TEXT = (
-    "🔍 Поиск новостей про компанию, человека или проект.\n\n"
-    "Напишите команду и имя латиницей, например:\n"
-    "/entity Binance\n/entity BlackRock\n/entity Michael Saylor"
+    "🔍 Новости по конкретной монете.\n\n"
+    "Напишите команду и тикер, например: /entity AAVE\n\n"
+    "Доступные тикеры: " + ", ".join(ALLOWED_ENTITIES)
 )
 
 RESEARCH_HINT_TEXT = (
-    "🧠 Исследование: подробный разбор от ИИ по новостям за последние 7 дней.\n\n"
+    "🔬 ИИ-исследование: подробный разбор от ИИ по новостям за последние 7 дней.\n\n"
     "Напишите команду и вопрос, например:\n"
     "/research Как ETF влияет на биткоин\n"
     "/research Что происходит с Solana"
@@ -286,10 +318,20 @@ def ai_limit_ok(user_id):
     return check_and_update_limit(user_id, DAILY_AI_LIMIT)
 
 
-async def send_long(message: Message, text):
-    """Отправляет текст любой длины несколькими сообщениями."""
-    for part in split_text(text):
-        await message.answer(part)
+async def send_long(message: Message, text, reply_markup=None):
+    """Отправляет текст любой длины несколькими сообщениями. Кнопки — под последним из них."""
+    parts = split_text(text)
+    for i, part in enumerate(parts):
+        await message.answer(part, reply_markup=reply_markup if i == len(parts) - 1 else None)
+
+
+def remember_context(user_id, text):
+    """Запоминает отправленный текст для /theory (users.last_context)."""
+    try:
+        save_last_context(user_id, text)
+    except Exception:
+        # Ошибка базы не должна мешать ответу пользователю
+        logger.exception("Не удалось сохранить last_context для user_id=%s", user_id)
 
 
 # ============================================================
@@ -303,12 +345,25 @@ def news_text():
     return with_time("📰 Последние новости:\n\n" + "\n\n".join(format_event(e) for e in events))
 
 
+def is_defi(event):
+    tags = (event.get("category_tags") or "").split(",")
+    return any(tag.strip() in DEFI_TAGS for tag in tags)
+
+
+def top_score(event):
+    """Оценка для /top: insider_score, у DeFi-новостей — с бонусом."""
+    return event["insider_score"] + (DEFI_PRIORITY_BONUS if is_defi(event) else 0)
+
+
 def top_text():
-    # Берём последние 50 событий и выбираем 5 с самым высоким insider_score
-    events = sorted(get_recent_events(50), key=lambda e: e["insider_score"], reverse=True)[:5]
+    # Берём последние 50 событий и выбираем 5 с самой высокой оценкой (DeFi в приоритете)
+    events = sorted(get_recent_events(50), key=top_score, reverse=True)[:5]
     if not events:
         return with_time(NO_NEWS_TEXT)
-    return with_time("🕵️ Самые инсайдерские новости:\n\n" + "\n\n".join(format_event(e) for e in events))
+    return with_time(
+        "🎯 Топ-5 новостей, которые сильнее всего влияют на рынок (акцент на DeFi):\n\n"
+        + "\n\n".join(format_event(e) for e in events)
+    )
 
 
 def tag_text(command_name):
@@ -360,16 +415,21 @@ def format_date(created_at):
         return str(created_at)
 
 
-def entity_text(name):
-    """Новости про сущность (компанию, человека, проект)."""
-    name = name.strip()
-    if not name:
-        return "Напишите, что искать. Например: /entity Binance"
+def entity_text(ticker):
+    """Новости про актив. ticker — один из ALLOWED_ENTITIES (BTC, AAVE, ...)."""
+    ticker = ticker.strip().upper()
+    if ticker not in ALLOWED_ENTITIES:
+        return ENTITY_NOT_ALLOWED_TEXT
+    name = ENTITY_NAMES[ticker]
+    # В entities обычно полное имя ("Bitcoin"), но иногда и тикер ("XRP", "BTC")
     events = get_events_by_entity(name, limit=10)
+    if not events and name != ticker:
+        events = get_events_by_entity(ticker, limit=10)
+    title = ticker if name == ticker else f"{ticker} ({name})"
     if not events:
-        return f"По запросу {name} ничего не найдено"
+        return f"По активу {title} новостей пока нет"
     items = [f"📅 {format_date(e['created_at'])}\n{e['title']}\n{e['summary']}" for e in events]
-    return f"🔍 Новости про {name} (найдено: {len(events)}):\n\n" + "\n\n".join(items)
+    return f"🔍 Новости про {title} (найдено: {len(events)}):\n\n" + "\n\n".join(items)
 
 
 # ============================================================
@@ -446,8 +506,16 @@ async def personal_ai_text(action, user_id):
 # ============================================================
 
 @dp.message(CommandStart())
-@dp.message(Command("help"))
 async def cmd_start(message: Message):
+    """Приветствие ИИ-аналитика и меню кнопок."""
+    if not await check_access(message):
+        return
+    await message.answer(START_TEXT, reply_markup=menu_keyboard(message.from_user.id))
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    """Полный список команд и то же меню кнопок."""
     if not await check_access(message):
         return
     user_id = message.from_user.id
@@ -468,7 +536,9 @@ async def cmd_stats(message: Message):
 async def cmd_news(message: Message):
     if not await check_access(message):
         return
-    await send_long(message, news_text())
+    text = news_text()
+    remember_context(message.from_user.id, text)
+    await send_long(message, text)
 
 
 @dp.message(Command("top"))
@@ -497,7 +567,9 @@ async def cmd_briefing(message: Message):
         await message.answer(LIMIT_TEXT)
         return
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    await send_long(message, await personal_ai_text("briefing", message.from_user.id))
+    text = await personal_ai_text("briefing", message.from_user.id)
+    remember_context(message.from_user.id, text)
+    await send_long(message, text)
 
 
 @dp.message(Command("research"))
@@ -510,13 +582,18 @@ async def cmd_research(message: Message, command: CommandObject):
         # Без вопроса только подсказка — лимит не тратим
         await message.answer(RESEARCH_HINT_TEXT)
         return
+    if len(question) > MAX_RESEARCH_LENGTH:
+        # Слишком длинный вопрос тоже не тратит лимит
+        await message.answer(RESEARCH_TOO_LONG_TEXT)
+        return
     if not ai_limit_ok(message.from_user.id):
         await message.answer(LIMIT_TEXT)
         return
     logger.info("Исследование для user_id=%s: %s", message.from_user.id, question)
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     answer = await research_topic(question)
-    await send_long(message, with_time(f"🧠 Исследование: {question}\n\n{answer}"))
+    remember_context(message.from_user.id, answer)
+    await send_long(message, with_time(f"🔬 Исследование: {question}\n\n{answer}"))
 
 
 @dp.message(Command("settings"))
@@ -544,7 +621,7 @@ async def cmd_sentiment(message: Message, command: CommandObject):
 
 @dp.message(Command("entity"))
 async def cmd_entity(message: Message, command: CommandObject):
-    """/entity Binance — новости, где упоминается эта компания, человек или проект."""
+    """/entity AAVE — новости про актив из ALLOWED_ENTITIES."""
     if not await check_access(message):
         return
     logger.info("Поиск сущности '%s' от user_id=%s", command.args, message.from_user.id)
@@ -641,6 +718,215 @@ async def feedback_suggestions(message: Message, state: FSMContext):
 
 
 # ============================================================
+# Теория DeFi (/theory): термины из последнего ответа или своя тема (FSM)
+# ============================================================
+
+class TheoryStates(StatesGroup):
+    """Шаги «Теории DeFi». Предложенные термины и последний разбор хранятся в данных FSM."""
+    waiting_for_suggestion_choice = State()  # Предложили термины — ждём кнопку (или свою тему текстом)
+    waiting_for_topic = State()              # Ждём тему, написанную вручную
+
+
+THEORY_ASK_TOPIC_TEXT = "Хорошо, напишите тему или вопрос по DeFi, и я разберу её."
+THEORY_FIRST_TOPIC_TEXT = (
+    "📚 Теория DeFi: объясню любую тему простыми словами.\n\n"
+    "Напишите тему или вопрос по DeFi, например: «Что такое impermanent loss?»"
+)
+THEORY_OLD_BUTTON_TEXT = "Этот выбор уже неактивен. Начните заново: /theory"
+
+# Кнопки под объяснением темы
+THEORY_ANSWER_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="📖 Читаем", callback_data="theory_read"),
+    InlineKeyboardButton(text="🔄 Другое", callback_data="other_topic"),
+]])
+# Кнопка под главами
+THEORY_CHAPTERS_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="🔄 Другая тема", callback_data="other_topic"),
+]])
+
+
+def suggestions_keyboard(terms):
+    """По кнопке на каждый термин, ниже — «Изучаем» (все термины сразу) и «Другое»."""
+    rows = [
+        [InlineKeyboardButton(text=f"{i}. {term}", callback_data=f"theory_term:{i - 1}")]
+        for i, term in enumerate(terms, start=1)
+    ]
+    rows.append([
+        InlineKeyboardButton(text="✅ Изучаем", callback_data="read_suggested"),
+        InlineKeyboardButton(text="🔄 Другое", callback_data="other_topic"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def callback_allowed(callback: CallbackQuery):
+    """Проверка доступа для кнопок: при отказе показывает всплывающее сообщение."""
+    if is_allowed(callback.from_user.id):
+        return True
+    logger.warning("Отказано в доступе (кнопка): user_id=%s", callback.from_user.id)
+    await callback.answer(f"Доступ закрыт. Ваш Telegram id: {callback.from_user.id}", show_alert=True)
+    return False
+
+
+async def remove_buttons(callback: CallbackQuery):
+    """Убирает кнопки у сообщения, чтобы их нельзя было нажать ещё раз и потратить лимит дважды."""
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
+
+async def ask_theory_topic(message: Message, state: FSMContext, text=THEORY_ASK_TOPIC_TEXT):
+    await state.set_state(TheoryStates.waiting_for_topic)
+    await message.answer(text)
+
+
+async def start_theory(message: Message, user_id, state: FSMContext):
+    """Начало «Теории DeFi» (команда /theory и кнопка в меню): термины из last_context или ручной ввод."""
+    context = get_last_context(user_id)
+    data = await state.get_data()
+    # Заодно прерывает опрос /feedback, если он был начат
+    await state.clear()
+    if not context:
+        await ask_theory_topic(message, state, THEORY_FIRST_TOPIC_TEXT)
+        return
+
+    # Для этого же текста термины уже подбирали — не тратим повторный запрос к GPT
+    if data.get("theory_context") == context and data.get("theory_terms"):
+        terms = data["theory_terms"]
+    else:
+        await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+        terms = await suggest_topics_from_context(context)
+    if not terms:
+        # GPT не нашёл терминов или не ответил — просим тему вручную
+        await ask_theory_topic(message, state, THEORY_FIRST_TOPIC_TEXT)
+        return
+
+    await state.update_data(theory_context=context, theory_terms=terms)
+    await state.set_state(TheoryStates.waiting_for_suggestion_choice)
+    lines = "\n".join(f"{i}. {term}" for i, term in enumerate(terms, start=1))
+    await message.answer(
+        "🧠 Я проанализировал последнюю новость/ответ. Вот термины, которые могут быть вам интересны:\n"
+        f"{lines}\n\nИзучаем эти термины или хотите задать свою тему?",
+        reply_markup=suggestions_keyboard(terms),
+    )
+
+
+async def send_theory(message: Message, user_id, state: FSMContext, topic):
+    """Объяснение темы (3-4 предложения + план из 3 глав) с кнопками «Читаем» / «Другое»."""
+    if not ai_limit_ok(user_id):
+        await message.answer(LIMIT_TEXT)
+        return
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    text = await explain_topic(topic)
+    # Выходим из шагов FSM, но данные оставляем: «Читаем» берёт из них тему и план
+    await state.set_state(None)
+    if text == ERROR_TEXT:
+        await message.answer(text)
+        return
+    await state.update_data(theory_topic=topic, theory_plan=text)
+    await send_long(message, with_time(f"📚 Теория DeFi: {topic}\n\n{text}"), reply_markup=THEORY_ANSWER_KEYBOARD)
+
+
+@dp.message(Command("theory"))
+async def cmd_theory(message: Message, state: FSMContext):
+    if not await check_access(message):
+        return
+    await start_theory(message, message.from_user.id, state)
+
+
+@dp.callback_query(F.data == "theory")
+async def theory_button(callback: CallbackQuery, state: FSMContext):
+    if not await callback_allowed(callback):
+        return
+    await callback.answer()
+    await start_theory(callback.message, callback.from_user.id, state)
+
+
+@dp.callback_query(TheoryStates.waiting_for_suggestion_choice, F.data == "read_suggested")
+async def theory_read_suggested(callback: CallbackQuery, state: FSMContext):
+    """«✅ Изучаем»: один разбор сразу по всем предложенным терминам."""
+    if not await callback_allowed(callback):
+        return
+    await callback.answer()
+    await remove_buttons(callback)
+    terms = (await state.get_data()).get("theory_terms") or []
+    await send_theory(callback.message, callback.from_user.id, state, ", ".join(terms))
+
+
+@dp.callback_query(TheoryStates.waiting_for_suggestion_choice, F.data.startswith("theory_term:"))
+async def theory_pick_term(callback: CallbackQuery, state: FSMContext):
+    """Нажали на один термин: theory_term:0 — первый в списке."""
+    if not await callback_allowed(callback):
+        return
+    terms = (await state.get_data()).get("theory_terms") or []
+    index = callback.data.split(":")[-1]
+    if not index.isdigit() or int(index) >= len(terms):
+        await callback.answer(THEORY_OLD_BUTTON_TEXT, show_alert=True)
+        return
+    await callback.answer()
+    await remove_buttons(callback)
+    await send_theory(callback.message, callback.from_user.id, state, terms[int(index)])
+
+
+@dp.callback_query(F.data.in_({"read_suggested"}) | F.data.startswith("theory_term:"))
+async def theory_old_suggestion(callback: CallbackQuery):
+    """Нажали термин из старого списка (уже выбрали другой вариант или бот перезапускался)."""
+    await callback.answer(THEORY_OLD_BUTTON_TEXT, show_alert=True)
+
+
+@dp.callback_query(F.data == "theory_read")
+async def theory_read(callback: CallbackQuery, state: FSMContext):
+    """«📖 Читаем»: три главы по плану из последнего объяснения."""
+    if not await callback_allowed(callback):
+        return
+    data = await state.get_data()
+    topic, plan = data.get("theory_topic"), data.get("theory_plan")
+    if not topic or not plan:
+        await callback.answer(THEORY_OLD_BUTTON_TEXT, show_alert=True)
+        return
+    await callback.answer()
+    user_id = callback.from_user.id
+    message = callback.message
+    if not ai_limit_ok(user_id):
+        await message.answer(LIMIT_TEXT)
+        return
+    await remove_buttons(callback)
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    text = await read_chapters(topic, plan)
+    if text == ERROR_TEXT:
+        await message.answer(text)
+        return
+    await send_long(message, text, reply_markup=THEORY_CHAPTERS_KEYBOARD)
+
+
+@dp.callback_query(F.data == "other_topic")
+async def theory_other_topic(callback: CallbackQuery, state: FSMContext):
+    """«🔄 Другое»: ждём тему, написанную вручную."""
+    if not await callback_allowed(callback):
+        return
+    await callback.answer()
+    await remove_buttons(callback)
+    await ask_theory_topic(callback.message, state)
+
+
+# Любой из двух шагов: свою тему можно написать и вместо выбора кнопкой.
+# Команды во время шагов работают как обычно — их обработчики стоят выше
+@dp.message(
+    StateFilter(TheoryStates.waiting_for_topic, TheoryStates.waiting_for_suggestion_choice),
+    F.text,
+    ~F.text.startswith("/"),
+)
+async def theory_manual_topic(message: Message, state: FSMContext):
+    if not await check_access(message):
+        return
+    topic = message.text.strip()
+    if len(topic) > MAX_RESEARCH_LENGTH:
+        await message.answer(RESEARCH_TOO_LONG_TEXT)
+        return
+    await send_theory(message, message.from_user.id, state, topic)
+
+
+# ============================================================
 # Кнопки (InlineKeyboard под /start и /help)
 # ============================================================
 
@@ -723,6 +1009,9 @@ async def on_button(callback: CallbackQuery, state: FSMContext):
         logger.warning("Неизвестная кнопка: %s", callback.data)
         return
 
+    # Как и у команд /news и /briefing — запоминаем текст для /theory
+    if action in ("news", "briefing"):
+        remember_context(user_id, text)
     await send_long(message, text)
 
 
@@ -749,20 +1038,21 @@ async def run_bot():
     # Подсказки команд в меню Telegram
     commands = [
         # Тот же порядок, что в справке /help
-        BotCommand(command="news", description="Последние новости"),
-        BotCommand(command="top", description="Самые инсайдерские новости"),
-        BotCommand(command="briefing", description="Главное за 24 часа"),
-        BotCommand(command="btc", description="Новости Bitcoin"),
-        BotCommand(command="eth", description="Новости Ethereum"),
-        BotCommand(command="sol", description="Новости Solana"),
-        BotCommand(command="defi", description="Новости DeFi"),
-        BotCommand(command="sentiment", description="Тональность за 24 часа: /sentiment btc"),
-        BotCommand(command="entity", description="Поиск по имени: /entity Binance"),
-        BotCommand(command="digest", description="Дайджест от ИИ"),
-        BotCommand(command="research", description="Разбор от ИИ: /research вопрос"),
-        BotCommand(command="settings", description="Мои темы для брифинга и дайджеста"),
-        BotCommand(command="feedback", description="Оставить отзыв о боте"),
-        BotCommand(command="help", description="Справка"),
+        BotCommand(command="news", description="📰 Просто новости"),
+        BotCommand(command="top", description="🎯 Топ-тренды (DeFi)"),
+        BotCommand(command="briefing", description="🧠 ИИ-дайджест за 24 часа"),
+        BotCommand(command="btc", description="₿ Новости Bitcoin"),
+        BotCommand(command="eth", description="💎 Новости Ethereum"),
+        BotCommand(command="sol", description="☀️ Новости Solana"),
+        BotCommand(command="defi", description="🧪 Новости DeFi"),
+        BotCommand(command="sentiment", description="📊 ИИ: Настроение рынка — /sentiment btc"),
+        BotCommand(command="entity", description="🔍 Инфо по монете — /entity AAVE"),
+        BotCommand(command="digest", description="📝 ИИ: Краткая сводка"),
+        BotCommand(command="research", description="🔬 ИИ: Исследование — /research вопрос"),
+        BotCommand(command="theory", description="📚 Теория DeFi"),
+        BotCommand(command="settings", description="⚙️ Настройки тем"),
+        BotCommand(command="feedback", description="💬 Фидбек"),
+        BotCommand(command="help", description="❓ Справка"),
     ]
     await bot.set_my_commands(commands)
 
@@ -770,7 +1060,7 @@ async def run_bot():
     if ADMIN_ID:
         try:
             await bot.set_my_commands(
-                commands + [BotCommand(command="stats", description="Статистика бота (админ)")],
+                commands + [BotCommand(command="stats", description="📈 Статистика бота (админ)")],
                 scope=BotCommandScopeChat(chat_id=ADMIN_ID),
             )
         except TelegramBadRequest:

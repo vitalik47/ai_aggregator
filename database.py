@@ -127,6 +127,12 @@ def init_db():
             )
             """
         )
+        # last_context — последний текст новостей или ответа ИИ, отправленный пользователю (для /theory).
+        # Колонка появилась позже, поэтому для старой базы добавляем её отдельно
+        user_columns = [row["name"] for row in conn.execute("PRAGMA table_info(users)")]
+        if "last_context" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN last_context TEXT")
+            logger.info("В таблицу users добавлена колонка last_context")
         # Пользователей, которые были до появления таблицы users, переносим из других таблиц.
         # Когда они пришли впервые — неизвестно, поэтому first_seen = NULL (в «новых сегодня» не попадут).
         # Эти таблицы уже созданы выше
@@ -421,6 +427,25 @@ def register_user(user_id):
             """,
             (user_id,),
         )
+
+
+def save_last_context(user_id, text):
+    """Запоминает последний текст, который бот отправил пользователю (новости или ответ ИИ)."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (user_id, last_context) VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET last_context = excluded.last_context
+            """,
+            (user_id, text),
+        )
+
+
+def get_last_context(user_id):
+    """Последний сохранённый текст для пользователя или пустая строка."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT last_context FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return (row["last_context"] if row else None) or ""
 
 
 def get_total_users():

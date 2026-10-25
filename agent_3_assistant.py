@@ -53,6 +53,7 @@ BRIEFING_PROMPT = """You are a professional crypto market analyst.
 Below are the news events from the last 24 hours.
 Pick the 3-5 most important ones. For each, write a headline and one line on why it matters.
 Then describe the main trend in one or two sentences.
+Pay special attention to DeFi events (DEX, yield, liquidity, lending): if they are important, prefer them.
 Write in Russian. Plain text, no Markdown. Use EXACTLY this format:
 
 🔥 Главное за 24 часа:
