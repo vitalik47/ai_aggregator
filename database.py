@@ -51,7 +51,8 @@ def init_db():
                 source TEXT,
                 text TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                processed INTEGER DEFAULT 0
+                processed INTEGER DEFAULT 0,
+                url TEXT
             )
             """
         )
@@ -67,18 +68,24 @@ def init_db():
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 category_tags TEXT,
                 sentiment TEXT,
-                entities TEXT
+                entities TEXT,
+                url TEXT
             )
             """
         )
 
         # Миграция для старой базы: добавляем колонки, которых ещё нет.
         # (CREATE TABLE IF NOT EXISTS не меняет уже существующую таблицу)
-        columns = [row["name"] for row in conn.execute("PRAGMA table_info(events)")]
-        for column in ["category_tags", "sentiment", "entities"]:
-            if column not in columns:
-                conn.execute(f"ALTER TABLE events ADD COLUMN {column} TEXT")
-                logger.info("В таблицу events добавлена колонка %s", column)
+        # url — ссылка на оригинальную статью или пост (у старых записей её нет)
+        for table, new_columns in [
+            ("events", ["category_tags", "sentiment", "entities", "url"]),
+            ("raw_messages", ["url"]),
+        ]:
+            columns = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})")]
+            for column in new_columns:
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+                    logger.info("В таблицу %s добавлена колонка %s", table, column)
 
         # Настройки пользователей бота: какие темы (теги) им интересны
         conn.execute(
@@ -144,12 +151,15 @@ def init_db():
     logger.info("База данных инициализирована: %s", DATABASE_PATH)
 
 
-def save_raw_message(source_type, source, text):
-    """Сохраняет «сырое» сообщение. source_type: 'telegram' или 'rss'. Возвращает id записи."""
+def save_raw_message(source_type, source, text, url=None):
+    """
+    Сохраняет «сырое» сообщение. source_type: 'telegram' или 'rss'. Возвращает id записи.
+    url — ссылка на оригинал: статья из RSS или пост в Telegram-канале.
+    """
     with get_connection() as conn:
         cursor = conn.execute(
-            "INSERT INTO raw_messages (source_type, source, text) VALUES (?, ?, ?)",
-            (source_type, source, text),
+            "INSERT INTO raw_messages (source_type, source, text, url) VALUES (?, ?, ?, ?)",
+            (source_type, source, text, url),
         )
         new_id = cursor.lastrowid
     logger.debug("Сохранено сообщение id=%s из %s (%s)", new_id, source, source_type)
@@ -198,9 +208,13 @@ def clean_entity_name(name):
     return " ".join(str(name).replace(",", " ").split())
 
 
-def save_event(title, summary, category, source, insider_score, category_tags=None, sentiment=None, entities=None):
+def save_event(
+    title, summary, category, source, insider_score, category_tags=None, sentiment=None, entities=None, url=None
+):
     """
     Сохраняет отфильтрованное событие. Возвращает id записи.
+    insider_score — важность новости от 1 до 10 (шкала в промпте agent_2_filter.py).
+    url — ссылка на оригинальную статью.
     category_tags — список тегов, например ["defi", "ethereum"].
     В базе хранится строкой через запятую: "defi,ethereum".
     sentiment — тональность: "positive", "negative" или "neutral".
@@ -212,10 +226,10 @@ def save_event(title, summary, category, source, insider_score, category_tags=No
     with get_connection() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO events (title, summary, category, source, insider_score, category_tags, sentiment, entities)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO events (title, summary, category, source, insider_score, category_tags, sentiment, entities, url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (title, summary, category, source, insider_score, tags_text, sentiment, entities_text),
+            (title, summary, category, source, insider_score, tags_text, sentiment, entities_text, url),
         )
         new_id = cursor.lastrowid
     logger.info("Сохранено событие id=%s [%s, %s]: %s", new_id, tags_text, sentiment, title)

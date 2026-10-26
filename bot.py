@@ -4,21 +4,23 @@ Telegram-бот (aiogram 3).
 Команды:
 /start, /help — справка
 /news         — последние события из базы (без GPT, бесплатно)
-/top          — 5 событий с самым высоким insider_score (DeFi-новости получают бонус DEFI_PRIORITY_BONUS)
-/digest       — дайджест от Агента №3
-/briefing     — главное за 24 часа (доступна всем, даже при ALLOWED_USER_IDS)
+/top          — 5 событий с самой высокой важностью insider_score (DeFi-новости получают бонус DEFI_PRIORITY_BONUS)
+/briefing     — главное за 24 часа от Агента №3 (доступна всем, даже при ALLOWED_USER_IDS)
 /defi, /btc, /eth, /sol — 5 последних новостей по теме (по тегам из category_tags)
 /sentiment btc — тональность новостей по теме за 24 часа (без темы — по всем новостям)
 /entity AAVE  — новости про актив; только тикеры из ALLOWED_ENTITIES (поиск по колонке entities)
 /research вопрос — подробный разбор от Агента №4 (agent_4_researcher.py) по новостям за 7 дней,
                    вопрос не длиннее MAX_RESEARCH_LENGTH символов
-/theory       — «Теория DeFi» от Агента №5: термины из последнего ответа (users.last_context) или своя тема (FSM)
-/settings     — выбор тем (таблица user_preferences); /briefing и /digest учитывают их
-/feedback     — опрос из 3 шагов (FSM), ответы сохраняются в таблицу feedback
+/theory       — «Учебная справка по DeFi» от Агента №5: 2-3 предложения о термине из /theory <термин>
+                или из последнего ответа (users.last_context)
+                + ссылка на сайт с материалами (LANDING_URL)
+/settings     — выбор тем (таблица user_preferences); /briefing учитывает их
+/feedback     — опрос из 3 шагов (FSM), ответы сохраняются в таблицу feedback.
+                Кнопка «Отменить» на каждом шаге; любая команда или кнопка меню тоже отменяет опрос
 /stats        — статистика (пользователи, запросы к ИИ) — только для ADMIN_ID из .env
-Любой текст   — вопрос Агенту №3
+Любой текст   — вопрос Агенту №3 (текст с «/» — неизвестная команда, в ИИ не отправляется)
 
-Запросы к ИИ (вопросы, /briefing, /digest, /research и кнопки брифинга/дайджеста) ограничены: DAILY_AI_LIMIT в день
+Запросы к ИИ (вопросы, /briefing, /research, /theory и кнопки брифинга и справки) ограничены: DAILY_AI_LIMIT в день
 на пользователя (таблица user_limits).
 
 В /start и /help под справкой есть кнопки (InlineKeyboard) — они делают то же, что команды.
@@ -27,13 +29,15 @@ Telegram-бот (aiogram 3).
 """
 
 import asyncio
+import html
 import logging
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -42,13 +46,14 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     Message,
 )
 
-from agent_3_assistant import ERROR_TEXT, answer_question, make_briefing, make_digest
+from agent_3_assistant import ERROR_TEXT, answer_question, make_briefing
 from agent_4_researcher import research_topic
-from agent_5_teacher import explain_topic, read_chapters, suggest_topics_from_context
-from config import ADMIN_ID, ALLOWED_USER_IDS, DAILY_AI_LIMIT, TELEGRAM_BOT_TOKEN
+from agent_5_teacher import explain_term
+from config import ADMIN_ID, ALLOWED_USER_IDS, DAILY_AI_LIMIT, LANDING_URL, TELEGRAM_BOT_TOKEN
 from database import (
     check_and_update_limit,
     get_ai_requests_today,
@@ -71,8 +76,9 @@ logger = logging.getLogger(__name__)
 
 # Telegram не принимает сообщения длиннее 4096 символов
 MAX_MESSAGE_LENGTH = 4000
-# События с такой оценкой и выше помечаем 🔥
-HOT_INSIDER_SCORE = 7
+# События с такой важностью и выше помечаем 🔥 (8-10 — крупные взломы, одобрения ETF, регуляторы)
+HOT_INSIDER_SCORE = 8
+NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 # Команды для выборки по темам: команда -> (тег в базе, заголовок ответа)
 TAG_COMMANDS = {
     "defi": ("defi", "🧪 DeFi"),
@@ -111,18 +117,26 @@ RESEARCH_TOO_LONG_TEXT = (
     "чтобы ИИ мог дать точный ответ."
 )
 
-# Список команд — общий для /start и /help
+# Список команд по блокам — общий для /start и /help
 COMMANDS_TEXT = (
-    "🧠 /briefing — Главные события за 24 часа (общий срез рынка)\n"
-    "🎯 /top — Топ-5 новостей, которые сильнее всего влияют на рынок (с акцентом на DeFi)\n"
-    f"🔍 /entity — Инфо по конкретной монете. Доступно {len(ALLOWED_ENTITIES)} активов (напр. /entity AAVE)\n"
-    "🕵️‍♂️ /research — Задай любой вопрос по крипте (напр. /research Что с Ethereum?)\n"
-    "📚 /theory — Теория DeFi: объясню сложные термины из последней новости простыми словами\n"
-    "📰 /news — Последние новости без ИИ-обработки\n"
-    "📊 /sentiment — Настроение рынка по конкретной монете\n"
-    "⚙️ /settings — Настроить темы (DeFi, NFT и т.д.)\n\n"
-    "❓ Или просто напишите вопрос, например: «Что нового с Bitcoin?»\n"
-    f"(запросов к ИИ — до {DAILY_AI_LIMIT} в день)"
+    "📰 Новости\n"
+    "/news — Последние новости (все подряд)\n"
+    "/top — Только самые важные новости (с высоким рейтингом)\n"
+    "/btc, /eth, /sol, /defi — Новости по теме\n\n"
+    "🧠 ИИ-Аналитика\n"
+    "/briefing — Главное за 24 часа: ключевые события и тренд\n"
+    "/sentiment — Настроение рынка по теме (напр. /sentiment btc)\n"
+    f"/entity — Новости по монете, доступно {len(ALLOWED_ENTITIES)} активов (напр. /entity AAVE)\n"
+    "/research — Подробный ответ на вопрос по крипте (напр. /research Что с Ethereum?)\n"
+    "Или просто напишите вопрос, например: «Что нового с Bitcoin?»\n"
+    f"(запросов к ИИ — до {DAILY_AI_LIMIT} в день)\n\n"
+    "📖 Обучение\n"
+    "/theory — Учебная справка по DeFi: коротко объясню термин (напр. /theory AMM)\n"
+    f"Учебник и симулятор DeFi Compass — скоро на сайте: {LANDING_URL}\n\n"
+    "⚙️ Настройки\n"
+    "/settings — Темы для брифинга (BTC, ETH, SOL, DeFi)\n"
+    "/feedback — Оставить отзыв о боте\n"
+    "/help — Эта справка"
 )
 
 # Приветствие на /start: коротко про бота + список команд
@@ -148,7 +162,7 @@ NO_RIGHTS_TEXT = "У вас нет прав"
 MENU_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
     # 1. Главное от ИИ + обычная лента
     [
-        InlineKeyboardButton(text="🧠 ИИ-дайджест", callback_data="briefing"),
+        InlineKeyboardButton(text="🧠 Главное за 24 часа", callback_data="briefing"),
         InlineKeyboardButton(text="🎯 Топ-тренды (DeFi)", callback_data="top"),
     ],
     [
@@ -168,11 +182,14 @@ MENU_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
     ],
     # 4. Прочее
     [
-        InlineKeyboardButton(text="📝 ИИ: Краткая сводка", callback_data="digest"),
         InlineKeyboardButton(text="🔬 ИИ: Исследование", callback_data="research"),
     ],
     [
-        InlineKeyboardButton(text="📚 Теория DeFi", callback_data="theory"),
+        InlineKeyboardButton(text="📖 Учебная справка по DeFi", callback_data="theory"),
+    ],
+    [
+        # Заглушка: платная подписка появится позже (pro_button только отвечает «скоро»)
+        InlineKeyboardButton(text="💎 Купить Pro", callback_data="pro"),
     ],
     [
         InlineKeyboardButton(text="💬 Фидбек", callback_data="feedback"),
@@ -277,19 +294,36 @@ async def check_access(message: Message):
     return False
 
 
+def source_name(source):
+    """
+    Источник для подписи: адрес RSS-ленты -> название сайта.
+    "https://www.coindesk.com/arc/outboundfeeds/rss/, @coindesk" -> "coindesk.com, @coindesk".
+    """
+    names = []
+    for part in (source or "").split(", "):
+        if part.startswith(("http://", "https://")):
+            part = urlparse(part).netloc.removeprefix("www.")
+        if part and part not in names:
+            names.append(part)
+    return ", ".join(names)
+
+
 def format_event(event):
-    """Одно событие в виде текста для Telegram."""
+    """Одно событие в виде текста для Telegram: заголовок, суть, важность, источник и ссылка на оригинал."""
     fire = "🔥 " if event["insider_score"] >= HOT_INSIDER_SCORE else ""
     # У старых событий тональности нет (колонка добавлена позже)
     mood = SENTIMENT_LABELS[event["sentiment"]][0] + " " if event.get("sentiment") in SENTIMENT_LABELS else ""
     text = (
         f"{fire}{event['title']}\n"
         f"{event['summary']}\n"
-        f"{mood}📂 {event['category']} | 🕵️ {event['insider_score']}/10 | {event['source']}"
+        f"{mood}📂 {event['category']} | ⭐ важность {event['insider_score']}/10 | {source_name(event['source'])}"
     )
     # У старых событий тегов нет (колонка добавлена позже)
     if event.get("category_tags"):
         text += f"\n🏷 {event['category_tags'].replace(',', ', ')}"
+    # Ссылка на статью есть только у событий, собранных после появления колонки url
+    if event.get("url"):
+        text += f"\n🔗 {event['url']}"
     return text
 
 
@@ -322,7 +356,12 @@ async def send_long(message: Message, text, reply_markup=None):
     """Отправляет текст любой длины несколькими сообщениями. Кнопки — под последним из них."""
     parts = split_text(text)
     for i, part in enumerate(parts):
-        await message.answer(part, reply_markup=reply_markup if i == len(parts) - 1 else None)
+        await message.answer(
+            part,
+            reply_markup=reply_markup if i == len(parts) - 1 else None,
+            # В ленте до 10 ссылок на статьи — большое превью первой из них только мешает
+            link_preview_options=NO_LINK_PREVIEW,
+        )
 
 
 def remember_context(user_id, text):
@@ -451,7 +490,7 @@ def topics_title(topics):
 def settings_text(topics):
     current = topics_title(topics) if topics else "все новости"
     return (
-        "⚙️ Ваши темы для /briefing и /digest\n\n"
+        "⚙️ Ваши темы для /briefing\n\n"
         "Нажмите на тему, чтобы включить или выключить её. Можно выбрать несколько.\n\n"
         f"Сейчас: {current}"
     )
@@ -488,16 +527,13 @@ def toggle_topic(user_id, tag):
     return topics
 
 
-async def personal_ai_text(action, user_id):
-    """Брифинг или дайджест с учётом тем пользователя."""
+async def briefing_text(user_id):
+    """Брифинг с учётом тем пользователя."""
     topics = user_topics(user_id)
-    if action == "briefing":
-        text = await make_briefing(topics=topics)
-    else:
-        text = await make_digest(topics=topics)
+    text = await make_briefing(topics=topics)
     if topics:
         text = f"🎯 Ваши темы: {topics_title(topics)} (изменить: /settings)\n\n" + text
-    # Время ставим после ответа GPT — в момент, когда брифинг или дайджест готов
+    # Время ставим после ответа GPT — в момент, когда брифинг готов
     return with_time(text)
 
 
@@ -550,19 +586,6 @@ async def cmd_top(message: Message):
     await send_long(message, text)
 
 
-@dp.message(Command("digest"))
-async def cmd_digest(message: Message):
-    if not await check_access(message):
-        return
-    if not ai_limit_ok(message.from_user.id):
-        await message.answer(LIMIT_TEXT)
-        return
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    text = await personal_ai_text("digest", message.from_user.id)
-    remember_context(message.from_user.id, text)
-    await send_long(message, text)
-
-
 @dp.message(Command("briefing"))
 async def cmd_briefing(message: Message):
     # Без check_access: брифинг пока бесплатный и доступен всем
@@ -571,7 +594,7 @@ async def cmd_briefing(message: Message):
         await message.answer(LIMIT_TEXT)
         return
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    text = await personal_ai_text("briefing", message.from_user.id)
+    text = await briefing_text(message.from_user.id)
     remember_context(message.from_user.id, text)
     await send_long(message, text)
 
@@ -643,14 +666,24 @@ class FeedbackForm(StatesGroup):
     suggestions = State()  # Шаг 3: что добавить (текст)
 
 
-FEEDBACK_INTERESTED_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[[
-    InlineKeyboardButton(text="👍 Да", callback_data="fb:interested:yes"),
-    InlineKeyboardButton(text="👎 Нет", callback_data="fb:interested:no"),
-]])
-FEEDBACK_PAY_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[[
-    InlineKeyboardButton(text="💰 Да", callback_data="fb:pay:yes"),
-    InlineKeyboardButton(text="🆓 Только бесплатно", callback_data="fb:pay:free"),
-]])
+# Кнопка «Отменить» — на каждом шаге опроса
+FEEDBACK_CANCEL_ROW = [InlineKeyboardButton(text="❌ Отменить", callback_data="fb:cancel")]
+FEEDBACK_INTERESTED_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
+    [
+        InlineKeyboardButton(text="👍 Да", callback_data="fb:interested:yes"),
+        InlineKeyboardButton(text="👎 Нет", callback_data="fb:interested:no"),
+    ],
+    FEEDBACK_CANCEL_ROW,
+])
+FEEDBACK_PAY_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
+    [
+        InlineKeyboardButton(text="💰 Да", callback_data="fb:pay:yes"),
+        InlineKeyboardButton(text="🆓 Только бесплатно", callback_data="fb:pay:free"),
+    ],
+    FEEDBACK_CANCEL_ROW,
+])
+FEEDBACK_TEXT_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[FEEDBACK_CANCEL_ROW])
+FEEDBACK_CANCELLED_TEXT = "Опрос отменён. Пройти заново: /feedback"
 # Ответ в базе -> подпись для пользователя
 FEEDBACK_ANSWER_LABELS = {
     "interested": {"yes": "👍 Да", "no": "👎 Нет"},
@@ -675,6 +708,30 @@ async def mark_answer(callback: CallbackQuery, answer_text):
         await callback.message.edit_text(f"{callback.message.text}\n\nВаш ответ: {answer_text}")
     except TelegramBadRequest:
         pass
+
+
+def in_feedback(current_state):
+    """True, если пользователь сейчас на одном из шагов опроса ("FeedbackForm:suggestions" и т.п.)."""
+    return bool(current_state) and current_state.startswith(f"{FeedbackForm.__name__}:")
+
+
+@dp.message.outer_middleware()
+@dp.callback_query.outer_middleware()
+async def leave_feedback(handler, event, data):
+    """
+    Любая команда (/news, /help...) или кнопка меню во время опроса отменяет опрос.
+    Иначе брошенный на шаге 3 опрос «съел» бы следующий вопрос пользователя как отзыв.
+    """
+    state = data.get("state")
+    if isinstance(event, Message):
+        leaves = bool(event.text) and event.text.startswith("/")
+    else:
+        # Кнопки самого опроса (fb:...) опрос не отменяют
+        leaves = bool(event.data) and not event.data.startswith("fb:")
+    if state and leaves and in_feedback(await state.get_state()):
+        await state.clear()
+        logger.info("Опрос /feedback прерван: user_id=%s", event.from_user.id)
+    return await handler(event, data)
 
 
 @dp.message(Command("feedback"))
@@ -702,7 +759,23 @@ async def feedback_will_pay(callback: CallbackQuery, state: FSMContext):
     await mark_answer(callback, FEEDBACK_ANSWER_LABELS["pay"][answer])
     await state.update_data(will_pay=answer)
     await state.set_state(FeedbackForm.suggestions)
-    await callback.message.answer("Шаг 3/3. Что бы вы хотели добавить или изменить? Напишите одним сообщением.")
+    question = await callback.message.answer(
+        "Шаг 3/3. Что бы вы хотели добавить или изменить? Напишите одним сообщением.",
+        reply_markup=FEEDBACK_TEXT_KEYBOARD,
+    )
+    # Запоминаем вопрос, чтобы убрать у него кнопку «Отменить», когда придёт ответ
+    await state.update_data(question_message_id=question.message_id)
+
+
+@dp.callback_query(F.data == "fb:cancel")
+async def feedback_cancel(callback: CallbackQuery, state: FSMContext):
+    """«❌ Отменить» на любом шаге: выходим из опроса, ничего не сохраняем."""
+    if not in_feedback(await state.get_state()):
+        await callback.answer("Этот опрос уже неактивен. Начните заново: /feedback", show_alert=True)
+        return
+    await state.clear()
+    await mark_answer(callback, "❌ Отменено")
+    await callback.message.answer(FEEDBACK_CANCELLED_TEXT)
 
 
 @dp.callback_query(F.data.startswith("fb:"))
@@ -711,79 +784,41 @@ async def feedback_old_button(callback: CallbackQuery):
     await callback.answer("Этот опрос уже неактивен. Начните заново: /feedback", show_alert=True)
 
 
-# Команды (/news и др.) во время шага 3 обрабатываются как обычно — их обработчики стоят выше.
-# Неизвестные команды тоже не считаем ответом
+# Команды во время шага 3 сюда не попадают: leave_feedback уже отменил опрос, и команда выполняется как обычно
 @dp.message(FeedbackForm.suggestions, F.text, ~F.text.startswith("/"))
 async def feedback_suggestions(message: Message, state: FSMContext):
     data = await state.get_data()
     save_feedback(message.from_user.id, data["is_interested"], data["will_pay"], message.text.strip())
     await state.clear()
+    if data.get("question_message_id"):
+        try:
+            await message.bot.edit_message_reply_markup(
+                chat_id=message.chat.id, message_id=data["question_message_id"], reply_markup=None
+            )
+        except TelegramBadRequest:
+            pass
     await message.answer("Спасибо! Ваше мнение очень важно для нас. 🙏")
 
 
 # ============================================================
-# Теория DeFi (/theory): термины из последнего ответа или своя тема (FSM)
+# Учебная справка по DeFi (/theory): 2-3 предложения о термине + ссылка на сайт
 # ============================================================
 
-class TheoryStates(StatesGroup):
-    """Шаги «Теории DeFi». Предложенные термины и последний разбор хранятся в данных FSM."""
-    waiting_for_suggestion_choice = State()  # Предложили термины — ждём кнопку (или свою тему текстом)
-    waiting_for_topic = State()              # Ждём тему, написанную вручную
-
-
-THEORY_ASK_TOPIC_TEXT = "Хорошо, напишите тему или вопрос по DeFi, и я разберу её."
-THEORY_FIRST_TOPIC_TEXT = (
-    "📚 Теория DeFi: объясню любую тему простыми словами.\n\n"
-    "Напишите тему или вопрос по DeFi, например: «Что такое impermanent loss?»"
+THEORY_TITLE = "📖 Учебная справка по DeFi"
+THEORY_NO_CONTEXT_TEXT = (
+    f"{THEORY_TITLE}: коротко объясню сложный термин из последней новости или ответа ИИ.\n\n"
+    "Сначала откройте новости (/news) или брифинг (/briefing), а потом снова нажмите кнопку справки.\n"
+    "Или спросите про термин сразу: /theory impermanent loss"
 )
-THEORY_OLD_BUTTON_TEXT = "Этот выбор уже неактивен. Начните заново: /theory"
-
-# Кнопка под главами и под объяснением без подходящих глав
-THEORY_CHAPTERS_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[[
-    InlineKeyboardButton(text="🔄 Другая тема", callback_data="other_topic"),
-]])
 
 
-def lesson_keyboard(lesson_id, chapters):
-    """
-    Под объяснением: по кнопке на каждую главу, ниже — «Читаем» (все главы) и «Другое».
-    lesson_id в callback_data — чтобы кнопки старого объяснения не открыли главы нового.
-    """
-    if not chapters:
-        return THEORY_CHAPTERS_KEYBOARD
-    rows = [
-        [InlineKeyboardButton(text=f"📖 {i}. {name}", callback_data=f"theory_chapter:{lesson_id}:{i - 1}")]
-        for i, name in enumerate(chapters, start=1)
-    ]
-    rows.append([
-        InlineKeyboardButton(text="📖 Читаем", callback_data=f"theory_read:{lesson_id}"),
-        InlineKeyboardButton(text="🔄 Другое", callback_data="other_topic"),
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def lesson_text(topic, lesson):
-    """Объяснение + список глав."""
-    text = f"📚 Теория DeFi: {topic}\n\n{lesson['explanation']}"
-    if lesson["chapters"]:
-        lines = "\n".join(f"{i}. {name}" for i, name in enumerate(lesson["chapters"], start=1))
-        text += f"\n\n📖 Главы для изучения:\n{lines}\n\nНажмите на главу или «Читаем» — все главы сразу."
-    else:
-        text += "\n\nПодходящих глав по этой теме нет. Можно задать другую тему."
-    return text
-
-
-def suggestions_keyboard(terms):
-    """По кнопке на каждый термин, ниже — «Изучаем» (все термины сразу) и «Другое»."""
-    rows = [
-        [InlineKeyboardButton(text=f"{i}. {term}", callback_data=f"theory_term:{i - 1}")]
-        for i, term in enumerate(terms, start=1)
-    ]
-    rows.append([
-        InlineKeyboardButton(text="✅ Изучаем", callback_data="read_suggested"),
-        InlineKeyboardButton(text="🔄 Другое", callback_data="other_topic"),
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def theory_footer_html():
+    """Ссылка на сайт с полными материалами — в конце каждого ответа справки."""
+    return (
+        "\n\n📚 <b>Хочешь узнать больше, чтобы не терять деньги?</b>\n"
+        "Полный учебник и симулятор DeFi Compass скоро появятся на моем сайте. "
+        f"Следи за обновлениями: {html.escape(LANDING_URL)}"
+    )
 
 
 async def callback_allowed(callback: CallbackQuery):
@@ -795,204 +830,64 @@ async def callback_allowed(callback: CallbackQuery):
     return False
 
 
-async def remove_buttons(callback: CallbackQuery):
-    """Убирает кнопки у сообщения, чтобы их нельзя было нажать ещё раз и потратить лимит дважды."""
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except TelegramBadRequest:
-        pass
-
-
-async def ask_theory_topic(message: Message, state: FSMContext, text=THEORY_ASK_TOPIC_TEXT):
-    await state.set_state(TheoryStates.waiting_for_topic)
-    await message.answer(text)
-
-
-async def start_theory(message: Message, user_id, state: FSMContext):
-    """Начало «Теории DeFi» (команда /theory и кнопка в меню): термины из last_context или ручной ввод."""
-    context = get_last_context(user_id)
-    # Номер урока сохраняем: по нему отличаем кнопки старых объяснений от новых
-    lesson_id = (await state.get_data()).get("theory_lesson_id", 0)
-    # Заодно прерывает опрос /feedback, если он был начат
-    await state.clear()
-    await state.update_data(theory_lesson_id=lesson_id)
-    logger.info("Теория для user_id=%s: last_context %d символов", user_id, len(context))
-    if not context:
-        await ask_theory_topic(message, state, THEORY_FIRST_TOPIC_TEXT)
+async def send_theory(message: Message, user_id, term=""):
+    """
+    Справка по термину: term — из команды (/theory AMM), без него — самый сложный термин из last_context.
+    Ровно один запрос к GPT, ответ ограничен MAX_ANSWER_TOKENS (agent_5_teacher.py).
+    """
+    context = "" if term else get_last_context(user_id)
+    logger.info("Справка для user_id=%s: термин %r, last_context %d символов", user_id, term, len(context))
+    if not term and not context:
+        await message.answer(html.escape(THEORY_NO_CONTEXT_TEXT) + theory_footer_html(), parse_mode="HTML")
         return
-
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    terms = await suggest_topics_from_context(context)
-    if not terms:
-        # GPT не нашёл терминов или не ответил — просим тему вручную
-        await ask_theory_topic(message, state, THEORY_FIRST_TOPIC_TEXT)
-        return
-
-    await state.update_data(theory_terms=terms)
-    await state.set_state(TheoryStates.waiting_for_suggestion_choice)
-    lines = "\n".join(f"{i}. {term}" for i, term in enumerate(terms, start=1))
-    await message.answer(
-        "🧠 Я проанализировал последнюю новость/ответ. Вот термины, которые могут быть вам интересны:\n"
-        f"{lines}\n\nИзучаем эти термины или хотите задать свою тему?",
-        reply_markup=suggestions_keyboard(terms),
-    )
-
-
-async def send_theory(message: Message, user_id, state: FSMContext, topic):
-    """Объяснение темы (3 предложения) + до 3 глав кнопками, «Читаем» и «Другое»."""
     if not ai_limit_ok(user_id):
         await message.answer(LIMIT_TEXT)
         return
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    lesson, error = await explain_topic(topic)
-    if error:
-        # Ждём тему снова — пользователь может просто написать её ещё раз
-        await state.set_state(TheoryStates.waiting_for_topic)
-        await message.answer(error)
+    answer = await explain_term(term=term, context=context)
+    if answer == ERROR_TEXT:
+        await message.answer(answer)
         return
-    # Выходим из шагов FSM, но данные оставляем: кнопки глав берут из них тему и главы
-    await state.set_state(None)
-    lesson_id = (await state.get_data()).get("theory_lesson_id", 0) + 1
-    await state.update_data(theory_lesson_id=lesson_id, theory_topic=topic, theory_lesson=lesson)
-    await send_long(
-        message, with_time(lesson_text(topic, lesson)), reply_markup=lesson_keyboard(lesson_id, lesson["chapters"])
-    )
-
-
-async def current_lesson(callback: CallbackQuery, state: FSMContext):
-    """
-    Урок, к которому относится кнопка (theory_read:<id> или theory_chapter:<id>:<n>).
-    Кнопка от старого объяснения или после перезапуска бота -> None и всплывающее сообщение.
-    """
-    data = await state.get_data()
-    parts = callback.data.split(":")
-    lesson = data.get("theory_lesson")
-    if not lesson or not lesson["chapters"] or parts[1] != str(data.get("theory_lesson_id")):
-        await callback.answer(THEORY_OLD_BUTTON_TEXT, show_alert=True)
-        return None
-    return data["theory_topic"], lesson
-
-
-async def send_chapters(callback: CallbackQuery, topic, lesson, chapters, first_number, reply_markup):
-    """Пишет главы (тратит запрос к ИИ) и отправляет их с кнопками reply_markup."""
-    await callback.answer()
-    user_id = callback.from_user.id
-    message = callback.message
-    if not ai_limit_ok(user_id):
-        await message.answer(LIMIT_TEXT)
-        return
-    await remove_buttons(callback)
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    text = await read_chapters(topic, lesson["explanation"], chapters, first_number)
-    if text == ERROR_TEXT:
-        await message.answer(text)
-        return
-    await send_long(message, text, reply_markup=reply_markup)
+    # Ответ GPT экранируем: символы < > & в нём не должны ломать HTML-разметку
+    text = html.escape(f"{THEORY_TITLE}\n\n{answer}") + theory_footer_html()
+    await message.answer(text, parse_mode="HTML")
 
 
 @dp.message(Command("theory"))
-async def cmd_theory(message: Message, state: FSMContext):
+async def cmd_theory(message: Message, command: CommandObject):
     if not await check_access(message):
         return
-    await start_theory(message, message.from_user.id, state)
+    term = (command.args or "").strip()
+    if len(term) > MAX_RESEARCH_LENGTH:
+        await message.answer(RESEARCH_TOO_LONG_TEXT)
+        return
+    await send_theory(message, message.from_user.id, term)
 
 
 @dp.callback_query(F.data == "theory")
-async def theory_button(callback: CallbackQuery, state: FSMContext):
+async def theory_button(callback: CallbackQuery):
     if not await callback_allowed(callback):
         return
     await callback.answer()
-    await start_theory(callback.message, callback.from_user.id, state)
+    await send_theory(callback.message, callback.from_user.id)
 
 
-@dp.callback_query(TheoryStates.waiting_for_suggestion_choice, F.data == "read_suggested")
-async def theory_read_suggested(callback: CallbackQuery, state: FSMContext):
-    """«✅ Изучаем»: один разбор сразу по всем предложенным терминам."""
-    if not await callback_allowed(callback):
-        return
-    await callback.answer()
-    await remove_buttons(callback)
-    terms = (await state.get_data()).get("theory_terms") or []
-    await send_theory(callback.message, callback.from_user.id, state, ", ".join(terms))
-
-
-@dp.callback_query(TheoryStates.waiting_for_suggestion_choice, F.data.startswith("theory_term:"))
-async def theory_pick_term(callback: CallbackQuery, state: FSMContext):
-    """Нажали на один термин: theory_term:0 — первый в списке."""
-    if not await callback_allowed(callback):
-        return
-    terms = (await state.get_data()).get("theory_terms") or []
-    index = callback.data.split(":")[-1]
-    if not index.isdigit() or int(index) >= len(terms):
-        await callback.answer(THEORY_OLD_BUTTON_TEXT, show_alert=True)
-        return
-    await callback.answer()
-    await remove_buttons(callback)
-    await send_theory(callback.message, callback.from_user.id, state, terms[int(index)])
-
-
-# "theory_read" без номера урока — кнопка из сообщений, отправленных прошлой версией бота
-@dp.callback_query(F.data.in_({"read_suggested", "theory_read"}) | F.data.startswith("theory_term:"))
-async def theory_old_suggestion(callback: CallbackQuery):
-    """Нажали термин из старого списка (уже выбрали другой вариант или бот перезапускался)."""
-    await callback.answer(THEORY_OLD_BUTTON_TEXT, show_alert=True)
-
-
-@dp.callback_query(F.data.startswith("theory_read:"))
-async def theory_read(callback: CallbackQuery, state: FSMContext):
-    """«📖 Читаем»: все главы из последнего объяснения."""
-    if not await callback_allowed(callback):
-        return
-    found = await current_lesson(callback, state)
-    if not found:
-        return
-    topic, lesson = found
-    await send_chapters(callback, topic, lesson, lesson["chapters"], 1, THEORY_CHAPTERS_KEYBOARD)
-
-
-@dp.callback_query(F.data.startswith("theory_chapter:"))
-async def theory_chapter(callback: CallbackQuery, state: FSMContext):
-    """Одна глава: theory_chapter:<урок>:0 — первая. Под ней снова кнопки глав, чтобы читать дальше."""
-    if not await callback_allowed(callback):
-        return
-    found = await current_lesson(callback, state)
-    if not found:
-        return
-    topic, lesson = found
-    index = callback.data.split(":")[-1]
-    if not index.isdigit() or int(index) >= len(lesson["chapters"]):
-        await callback.answer(THEORY_OLD_BUTTON_TEXT, show_alert=True)
-        return
-    index = int(index)
-    keyboard = lesson_keyboard(callback.data.split(":")[1], lesson["chapters"])
-    await send_chapters(callback, topic, lesson, [lesson["chapters"][index]], index + 1, keyboard)
-
-
-@dp.callback_query(F.data == "other_topic")
-async def theory_other_topic(callback: CallbackQuery, state: FSMContext):
-    """«🔄 Другое»: ждём тему, написанную вручную."""
-    if not await callback_allowed(callback):
-        return
-    await callback.answer()
-    await remove_buttons(callback)
-    await ask_theory_topic(callback.message, state)
-
-
-# Любой из двух шагов: свою тему можно написать и вместо выбора кнопкой.
-# Команды во время шагов работают как обычно — их обработчики стоят выше
-@dp.message(
-    StateFilter(TheoryStates.waiting_for_topic, TheoryStates.waiting_for_suggestion_choice),
-    F.text,
-    ~F.text.startswith("/"),
+# Кнопки старой версии справки (выбор терминов, главы) в уже отправленных сообщениях
+@dp.callback_query(
+    F.data.in_({"read_suggested", "other_topic", "theory_read"})
+    | F.data.startswith("theory_term:")
+    | F.data.startswith("theory_read:")
+    | F.data.startswith("theory_chapter:")
 )
-async def theory_manual_topic(message: Message, state: FSMContext):
-    if not await check_access(message):
-        return
-    topic = message.text.strip()
-    if len(topic) > MAX_RESEARCH_LENGTH:
-        await message.answer(RESEARCH_TOO_LONG_TEXT)
-        return
-    await send_theory(message, message.from_user.id, state, topic)
+async def theory_old_button(callback: CallbackQuery):
+    await callback.answer(f"Эта кнопка устарела. Нажмите «{THEORY_TITLE}» в меню: /start", show_alert=True)
+
+
+@dp.callback_query(F.data == "pro")
+async def pro_button(callback: CallbackQuery):
+    """«💎 Купить Pro» — заглушка: платная подписка появится позже."""
+    # Без callback.answer() на кнопке крутились бы «часики»
+    await callback.answer("💎 Pro скоро появится")
 
 
 # ============================================================
@@ -1064,12 +959,13 @@ async def on_button(callback: CallbackQuery, state: FSMContext):
     elif action == "help":
         await message.answer(help_text(user_id), reply_markup=menu_keyboard(user_id))
         return
+    # "digest" — кнопка «Краткая сводка» из старых сообщений: сводки больше нет, отвечаем брифингом
     elif action in ("briefing", "digest"):
         if not ai_limit_ok(user_id):
             await message.answer(LIMIT_TEXT)
             return
         await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-        text = await personal_ai_text(action, user_id)
+        text = await briefing_text(user_id)
     elif action == "settings":
         topics = user_topics(user_id)
         await message.answer(settings_text(topics), reply_markup=settings_keyboard(topics))
@@ -1084,10 +980,17 @@ async def on_button(callback: CallbackQuery, state: FSMContext):
     await send_long(message, text)
 
 
+UNKNOWN_COMMAND_TEXT = "Такой команды нет. Список команд: /help"
+
+
 @dp.message(F.text)
 async def handle_question(message: Message):
     """Любой обычный текст считаем вопросом к ассистенту."""
     if not await check_access(message):
+        return
+    # Неизвестная или удалённая команда (например, /digest) — не тратим на неё запрос к ИИ
+    if message.text.startswith("/"):
+        await message.answer(UNKNOWN_COMMAND_TEXT)
         return
     if not ai_limit_ok(message.from_user.id):
         await message.answer(LIMIT_TEXT)
@@ -1109,18 +1012,17 @@ async def run_bot():
     # Подсказки команд в меню Telegram
     commands = [
         # Тот же порядок, что в справке /help
-        BotCommand(command="news", description="📰 Просто новости"),
-        BotCommand(command="top", description="🎯 Топ-тренды (DeFi)"),
-        BotCommand(command="briefing", description="🧠 ИИ-дайджест за 24 часа"),
+        BotCommand(command="news", description="📰 Последние новости (все подряд)"),
+        BotCommand(command="top", description="🎯 Только самые важные новости"),
         BotCommand(command="btc", description="₿ Новости Bitcoin"),
         BotCommand(command="eth", description="💎 Новости Ethereum"),
         BotCommand(command="sol", description="☀️ Новости Solana"),
         BotCommand(command="defi", description="🧪 Новости DeFi"),
+        BotCommand(command="briefing", description="🧠 Главное за 24 часа"),
         BotCommand(command="sentiment", description="📊 ИИ: Настроение рынка — /sentiment btc"),
         BotCommand(command="entity", description="🔍 Инфо по монете — /entity AAVE"),
-        BotCommand(command="digest", description="📝 ИИ: Краткая сводка"),
         BotCommand(command="research", description="🔬 ИИ: Исследование — /research вопрос"),
-        BotCommand(command="theory", description="📚 Теория DeFi"),
+        BotCommand(command="theory", description="📖 Учебная справка по DeFi"),
         BotCommand(command="settings", description="⚙️ Настройки тем"),
         BotCommand(command="feedback", description="💬 Фидбек"),
         BotCommand(command="help", description="❓ Справка"),

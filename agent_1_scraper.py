@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import time
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 import feedparser
@@ -41,6 +42,18 @@ def clean_html(text):
     text = re.sub(r"<[^>]+>", " ", text or "")
     text = html.unescape(text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def clean_url(url):
+    """
+    Ссылка на статью без меток рекламы: ...?utm_source=rss_feed&utm_medium=rss -> ...
+    Не http(s) — None (такую ссылку в Telegram не откроешь).
+    """
+    if not url.startswith(("http://", "https://")):
+        return None
+    parts = urlsplit(url)
+    query = [(key, value) for key, value in parse_qsl(parts.query) if not key.startswith("utm_")]
+    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
 def is_too_old(entry):
@@ -80,7 +93,8 @@ async def fetch_feed(session, url):
         if len(text) < MIN_TEXT_LENGTH or message_exists(url, text):
             continue
 
-        save_raw_message("rss", url, text)
+        # link — ссылка на саму статью (url здесь — адрес RSS-ленты)
+        save_raw_message("rss", url, text, url=clean_url(link))
         new_count += 1
     return new_count
 
@@ -169,8 +183,10 @@ async def telegram_listener():
         chat = await event.get_chat()
         username = getattr(chat, "username", None)
         source = f"@{username}" if username else str(event.chat_id)
+        # Ссылка на пост: https://t.me/<канал>/<номер сообщения> (у закрытых каналов без username её нет)
+        post_url = f"https://t.me/{username}/{event.id}" if username else None
 
-        save_raw_message("telegram", source, text)
+        save_raw_message("telegram", source, text, url=post_url)
         logger.info("Новое сообщение из %s", source)
 
     logger.info("Слушаю Telegram-каналов: %d", len(channels))

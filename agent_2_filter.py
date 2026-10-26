@@ -3,7 +3,8 @@
 
 Берёт необработанные сообщения из raw_messages пачками, отправляет их в GPT и
 получает обратно только настоящие новости (без рекламы, мусора и дублей).
-Каждая новость сохраняется в таблицу events с категорией и оценкой insider_score.
+Каждая новость сохраняется в таблицу events с категорией, оценкой важности (insider_score)
+и ссылкой на оригинал.
 """
 
 import asyncio
@@ -45,9 +46,12 @@ Your tasks:
    - "title": short headline in Russian, max 100 characters
    - "summary": 2-3 sentences in Russian with the key facts
    - "category": one of {CATEGORIES}
-   - "insider_score": integer 1-10, how exclusive and early the information is
-     (1 = widely known mainstream news, 5 = notable but already public,
-      10 = exclusive leak or insider information from a credible source)
+   - "insider_score": integer, the importance of the news for the crypto market.
+     Rate importance from 1 to 10.
+     8-10: Major hacks, ETF approvals, big regulatory news, major price crashes/pumps.
+     5-6: Regular listings, partnership announcements, ordinary news.
+     1-4: Minor updates, rumors, ads.
+     Use the whole scale: rate each event on its own, do not give every event the same score.
    - "tags": list of topic tags, only from {TAGS}.
      Use every tag that fits (e.g. a DeFi protocol on Ethereum -> ["defi", "ethereum"]).
      Use ["other"] only if none of the other tags fit.
@@ -64,7 +68,7 @@ Your tasks:
    - "message_ids": list of ids of the messages this event is based on
 
 Respond ONLY with JSON in this format:
-{{"events": [{{"title": "...", "summary": "...", "category": "...", "insider_score": 5, "tags": ["bitcoin"], "sentiment": "neutral", "entities": ["BlackRock", "Bitcoin", "Larry Fink"], "message_ids": [1, 2]}}]}}
+{{"events": [{{"title": "...", "summary": "...", "category": "...", "insider_score": <integer 1-10>, "tags": ["bitcoin"], "sentiment": "neutral", "entities": ["BlackRock", "Bitcoin", "Larry Fink"], "message_ids": [1, 2]}}]}}
 If there is no real news, respond with {{"events": []}}."""
 
 
@@ -88,8 +92,9 @@ async def analyze_messages(messages):
 
 def save_events(events, messages):
     """Проверяет ответ GPT и сохраняет события в базу. Возвращает количество сохранённых."""
-    # По id сообщения находим его источник
+    # По id сообщения находим его источник и ссылку на оригинал
     source_by_id = {m["id"]: m["source"] for m in messages}
+    url_by_id = {m["id"]: m.get("url") for m in messages}
     saved = 0
 
     for event in events:
@@ -102,11 +107,13 @@ def save_events(events, messages):
         if category not in CATEGORIES:
             category = "other"
 
-        # insider_score приводим к числу от 1 до 10
+        # insider_score (важность) приводим к числу от 1 до 10.
+        # Нет оценки или она не число — ставим 5 («обычная новость»), чтобы новость не пропала из /top
         try:
-            insider_score = min(max(int(event.get("insider_score", 1)), 1), 10)
-        except (TypeError, ValueError):
-            insider_score = 1
+            insider_score = min(max(int(event["insider_score"]), 1), 10)
+        except (KeyError, TypeError, ValueError):
+            logger.warning("GPT не вернул оценку важности для «%s»: %r", title, event.get("insider_score"))
+            insider_score = 5
 
         # Оставляем только допустимые теги, без повторов; если ничего не подошло — "other"
         raw_tags = event.get("tags")
@@ -136,10 +143,15 @@ def save_events(events, messages):
                 entities.append(name)
         entities = entities[:MAX_ENTITIES]
 
-        sources = sorted({source_by_id[i] for i in event.get("message_ids", []) if i in source_by_id})
+        message_ids = event.get("message_ids")
+        if not isinstance(message_ids, list):
+            message_ids = []
+        sources = sorted({source_by_id[i] for i in message_ids if i in source_by_id})
         source = ", ".join(sources) or "unknown"
+        # Если GPT объединил несколько сообщений — берём ссылку первого, у которого она есть
+        url = next((url_by_id[i] for i in message_ids if url_by_id.get(i)), None)
 
-        save_event(title, summary, category, source, insider_score, tags, sentiment, entities)
+        save_event(title, summary, category, source, insider_score, tags, sentiment, entities, url)
         saved += 1
     return saved
 

@@ -34,28 +34,15 @@ ALLOWED_USER_IDS = [
 # Сколько дней хранить новости: старше — удаляются при запуске main.py,
 # а статьи RSS старше этого срока сборщик не сохраняет (иначе они вернутся как дубли)
 KEEP_DAYS = 7
-# Сколько запросов к ИИ (вопросы, /briefing, /digest) в день можно сделать одному пользователю
+# Сколько запросов к ИИ (вопросы, /briefing, /research, /theory) в день можно сделать одному пользователю
 _daily_limit = (os.getenv("DAILY_AI_LIMIT") or "").strip()
 DAILY_AI_LIMIT = int(_daily_limit) if _daily_limit.isdigit() else 15
 # Telegram id администратора (команда /stats). Не задан — /stats недоступна никому
 _admin_id = (os.getenv("ADMIN_ID") or "").strip()
 ADMIN_ID = int(_admin_id) if _admin_id.isdigit() else None
 
-# --- Теория DeFi (/theory): главы, из которых GPT выбирает 3 самые подходящие к вопросу ---
-THEORY_CHAPTERS = [
-    "Основы блокчейна и смарт-контрактов",
-    "Кошельки, ключи и безопасность",
-    "Стейблкоины",
-    "Децентрализованные биржи (DEX) и AMM",
-    "Пулы ликвидности и impermanent loss",
-    "Лендинг и заимствования",
-    "Стейкинг и ликвидный стейкинг",
-    "Доходное фермерство (yield farming)",
-    "Оракулы",
-    "Layer 2 и мосты между сетями",
-    "Токеномика и управление (DAO)",
-    "Риски DeFi: взломы, ликвидации, rug pull",
-]
+# Сайт с материалами (учебник, симулятор DeFi Compass). Полную ссылку можно задать в .env
+LANDING_URL = os.getenv("LANDING_URL") or "https://spectrum-gerbera-694.notion.site/"
 
 # --- Источники новостей ---
 TARGET_WEBSITES = [

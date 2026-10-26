@@ -1,7 +1,7 @@
 """
 Агент №3: Ассистент.
 
-Отвечает на вопросы пользователя, делает дайджест и брифинг за 24 часа.
+Отвечает на вопросы пользователя и делает брифинг за 24 часа.
 Работает только с событиями из таблицы events (их готовит Агент №2).
 Эти функции вызывает Telegram-бот (bot.py).
 """
@@ -38,17 +38,6 @@ Rules:
 News events (newest first):
 {events}"""
 
-DIGEST_PROMPT = """You are a crypto news editor. Write a short digest in Russian
-based ONLY on the news events listed below.
-Rules:
-- Start with one sentence about the overall picture.
-- Then list the most important events, one line each, starting with "•".
-- Put events with a high insider_score first and mark them with 🔥.
-- Plain text, up to 200 words, no Markdown tables.
-
-News events (newest first):
-{events}"""
-
 BRIEFING_PROMPT = """You are a professional crypto market analyst.
 Below are the news events from the last 24 hours.
 Pick the 3-5 most important ones. For each, write a headline and one line on why it matters.
@@ -72,19 +61,16 @@ def format_events(events):
     lines = []
     for e in events:
         lines.append(
-            f"- [{e['created_at']}] [{e['category']}] [insider_score {e['insider_score']}/10] "
+            f"- [{e['created_at']}] [{e['category']}] [importance {e['insider_score']}/10] "
             f"{e['title']}: {e['summary']} (source: {e['source']})"
         )
     return "\n".join(lines)
 
 
-async def ask_gpt(system_prompt, user_text, json_mode=False):
-    """
-    Один запрос к GPT. Возвращает текст ответа.
-    json_mode=True — GPT обязан вернуть JSON-объект (в промпте должно быть слово JSON).
-    """
-    # Без json_mode параметр не передаём вовсе — запрос остаётся таким же, как раньше
-    extra = {"response_format": {"type": "json_object"}} if json_mode else {}
+async def ask_gpt(system_prompt, user_text, max_tokens=None):
+    """Один запрос к GPT. Возвращает текст ответа. max_tokens — жёсткий потолок длины ответа."""
+    # Без потолка параметр не передаём вовсе — запросы других агентов остаются как раньше
+    extra = {"max_completion_tokens": max_tokens} if max_tokens else {}
     response = await client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
@@ -113,29 +99,6 @@ async def answer_question(question):
     return answer
 
 
-async def make_digest(limit=10, topics=None):
-    """
-    Делает короткий дайджест.
-    topics — список тегов пользователя (["bitcoin", "defi"]): тогда берём только его темы за 24 часа.
-    Без topics — последние limit событий, как раньше.
-    """
-    if topics:
-        events = get_events_by_topics(topics, hours=24, limit=limit)
-        if not events:
-            return NO_TOPIC_EVENTS_TEXT
-    else:
-        events = get_recent_events(limit)
-        if not events:
-            return NO_EVENTS_TEXT
-
-    logger.info("Готовлю дайджест по %d событиям (темы: %s)", len(events), topics or "все")
-    try:
-        return await ask_gpt(DIGEST_PROMPT.format(events=format_events(events)), "Make the digest.")
-    except OpenAIError:
-        logger.exception("Ошибка OpenAI API при создании дайджеста")
-        return ERROR_TEXT
-
-
 async def make_briefing(topics=None):
     """
     Брифинг: 3–5 главных событий за последние 24 часа + общий тренд.
@@ -161,10 +124,10 @@ async def make_briefing(topics=None):
 
 
 if __name__ == "__main__":
-    # Быстрая проверка из терминала: дайджест + ответ на вопрос
+    # Быстрая проверка из терминала: брифинг + ответ на вопрос
     async def demo():
-        print("=== Дайджест ===")
-        print(await make_digest())
+        print("=== Брифинг ===")
+        print(await make_briefing())
         print("\n=== Вопрос: Что нового с Bitcoin? ===")
         print(await answer_question("Что нового с Bitcoin?"))
 
