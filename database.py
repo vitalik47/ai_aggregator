@@ -511,6 +511,29 @@ def get_last_context(user_id):
     return (row["last_context"] if row else None) or ""
 
 
+def get_feedbacks(limit=20):
+    """Последние limit отзывов (словари), от новых к старым — для /feedbacks."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT user_id, is_interested, will_pay, suggestions, created_at FROM feedback "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_feedback_summary():
+    """
+    Сводка по ВСЕМ отзывам (а не только по последним):
+    {"total": N, "interested": {"yes": X, "no": Y}, "pay": {"yes": A, "free": B}}.
+    """
+    with get_connection() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+        interested = dict(conn.execute("SELECT is_interested, COUNT(*) FROM feedback GROUP BY is_interested").fetchall())
+        pay = dict(conn.execute("SELECT will_pay, COUNT(*) FROM feedback GROUP BY will_pay").fetchall())
+    return {"total": total, "interested": interested, "pay": pay}
+
+
 def get_total_users():
     """Сколько всего уникальных пользователей было у бота."""
     with get_connection() as conn:

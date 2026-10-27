@@ -19,6 +19,7 @@ Telegram-бот (aiogram 3).
 /feedback     — опрос из 3 шагов (FSM), ответы сохраняются в таблицу feedback.
                 Кнопка «Отменить» на каждом шаге; любая команда или кнопка меню тоже отменяет опрос
 /stats        — статистика (пользователи, запросы к ИИ) — только для ADMIN_ID из .env
+/feedbacks    — сводка и последние отзывы из /feedback — только для ADMIN_ID, скрыта из справки и меню
 Любой текст   — вопрос Агенту №3 (текст с «/» — неизвестная команда, в ИИ не отправляется)
 
 Пробный период: новый пользователь получает TRIAL_DAYS дней полного доступа (users.trial_end_date).
@@ -73,6 +74,8 @@ from database import (
     get_ai_requests_today,
     get_events_by_entity,
     get_events_by_tag,
+    get_feedback_summary,
+    get_feedbacks,
     get_last_context,
     get_new_users_today,
     get_recent_events,
@@ -660,6 +663,62 @@ async def cmd_stats(message: Message):
         await message.answer(NO_RIGHTS_TEXT)
         return
     await message.answer(stats_text())
+
+
+# /feedbacks: сколько последних отзывов показывать и по сколько в одном сообщении
+FEEDBACKS_LIMIT = 20
+FEEDBACKS_PER_MESSAGE = 5
+# Длинное пожелание обрезаем: 5 отзывов по ~700 символов + сводка ≈ 3750 — меньше лимита Telegram (4096)
+MAX_SUGGESTION_CHARS = 600
+
+
+def feedbacks_messages():
+    """
+    Сообщения для /feedbacks (HTML): сводка по всем отзывам + последние FEEDBACKS_LIMIT,
+    по FEEDBACKS_PER_MESSAGE в сообщении. Текст пользователей экранируется: < > & в пожеланиях
+    не сломают разметку.
+    """
+    summary = get_feedback_summary()
+    if not summary["total"]:
+        return ["📊 Отзывов пока нет."]
+    interested, pay = summary["interested"], summary["pay"]
+    head = (
+        f"📊 <b>Сводка по отзывам (всего: {summary['total']}):</b>\n"
+        f"👍 Интересен формат: Да — {interested.get('yes', 0)}, Нет — {interested.get('no', 0)}\n"
+        f"💰 Готовы платить $5: Да — {pay.get('yes', 0)}, Только бесплатно — {pay.get('free', 0)}\n\n"
+        "📝 <b>Последние отзывы:</b>"
+    )
+
+    items = []
+    for n, fb in enumerate(get_feedbacks(FEEDBACKS_LIMIT), start=1):
+        suggestion = (fb["suggestions"] or "").strip()
+        if len(suggestion) > MAX_SUGGESTION_CHARS:
+            suggestion = suggestion[:MAX_SUGGESTION_CHARS] + "…"
+        interest_icon = {"yes": "👍", "no": "👎"}.get(fb["is_interested"], "—")
+        pay_icon = {"yes": "💰", "free": "🆓"}.get(fb["will_pay"], "—")
+        items.append(
+            f"{n}. {format_date(fb['created_at'])} (ID: {fb['user_id']}) | Интерес: {interest_icon} | "
+            f"Оплата: {pay_icon} | Пожелание: «{html.escape(suggestion)}»"
+        )
+
+    messages = []
+    for start in range(0, len(items), FEEDBACKS_PER_MESSAGE):
+        chunk = "\n\n".join(items[start:start + FEEDBACKS_PER_MESSAGE])
+        messages.append(f"{head}\n{chunk}" if start == 0 else chunk)
+    return messages
+
+
+@dp.message(Command("feedbacks"))
+async def cmd_feedbacks(message: Message):
+    """Отзывы из /feedback — только для администратора (ADMIN_ID). В справке и меню команд её нет."""
+    if not is_admin(message.from_user.id):
+        logger.warning("Попытка открыть /feedbacks: user_id=%s", message.from_user.id)
+        await message.answer(NO_RIGHTS_TEXT)
+        return
+    messages = feedbacks_messages()
+    logger.info("Администратор открыл /feedbacks: сообщений %d", len(messages))
+    for text in messages:
+        await message.answer(text, parse_mode="HTML")
 
 
 @dp.message(Command("sources"))
