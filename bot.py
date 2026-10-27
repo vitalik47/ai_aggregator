@@ -4,6 +4,7 @@ Telegram-бот (aiogram 3).
 Команды:
 /start, /help — справка
 /news         — последние события из базы (без GPT; доступна и после пробного периода)
+/sources      — откуда бот берёт новости (список Telegram-каналов и RSS-лент)
 /top          — 5 событий с самой высокой важностью insider_score (DeFi-новости получают бонус DEFI_PRIORITY_BONUS)
 /briefing     — главное за 24 часа от Агента №3 (доступна всем, даже при ALLOWED_USER_IDS)
 /defi, /btc, /eth, /sol — 5 последних новостей по теме (по тегам из category_tags)
@@ -62,6 +63,8 @@ from config import (
     ALLOWED_USER_IDS,
     DAILY_AI_LIMIT,
     LANDING_URL,
+    TARGET_CHANNELS,
+    TARGET_WEBSITES,
     TELEGRAM_BOT_TOKEN,
     TRIAL_DAYS,
 )
@@ -133,7 +136,8 @@ RESEARCH_TOO_LONG_TEXT = (
 COMMANDS_TEXT = (
     "📰 Новости\n"
     "/news — Последние новости (все подряд)\n"
-    "/top — Только самые важные новости (с высоким рейтингом)\n\n"
+    "/top — Только самые важные новости (с высоким рейтингом)\n"
+    "/sources — Откуда бот берёт новости\n\n"
     "🧠 ИИ-Аналитика\n"
     "/briefing — Главное за 24 часа: ключевые события и тренд\n"
     "/research — Подробный ответ на вопрос по крипте (напр. /research Что с Ethereum?)\n"
@@ -186,6 +190,7 @@ MENU_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
     ],
     [
         InlineKeyboardButton(text="📰 Просто новости", callback_data="news"),
+        InlineKeyboardButton(text="📡 Источники", callback_data="sources"),
     ],
     # 2. По темам
     [
@@ -361,6 +366,39 @@ def source_name(source):
         if part and part not in names:
             names.append(part)
     return ", ".join(names)
+
+
+def plural(n, one, few, many):
+    """Слово после числа: plural(1, "канал", "канала", "каналов") -> "канал", 3 -> "канала", 11 -> "каналов"."""
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def sources_text():
+    """
+    Текст /sources и кнопки «📡 Источники». Цифры и списки берутся из TARGET_CHANNELS и TARGET_WEBSITES
+    (config.py) при каждом вызове — после правки настроек текст обновится сам.
+    """
+    channels_count = len(TARGET_CHANNELS)
+    rss_count = len(TARGET_WEBSITES)
+    total = channels_count + rss_count
+    # У одного сайта бывает несколько лент (cointelegraph.com/rss/tag/...) — сайт показываем один раз
+    sites = source_name(", ".join(TARGET_WEBSITES))
+    sites_count = len(sites.split(", ")) if sites else 0
+
+    channels_line = ", ".join(TARGET_CHANNELS) if TARGET_CHANNELS else "пока не подключены"
+    rss_line = f"с {plural(sites_count, 'сайта', 'сайтов', 'сайтов')} {sites}" if sites else "пока не подключены"
+    return (
+        f"📡 Мы собираем новости из {total} {plural(total, 'источника', 'источников', 'источников')}: "
+        f"{channels_count} Telegram-{plural(channels_count, 'канал', 'канала', 'каналов')} "
+        f"и {rss_count} RSS-{plural(rss_count, 'лента', 'ленты', 'лент')}.\n\n"
+        f"Telegram-каналы ({channels_count}): {channels_line}.\n\n"
+        f"RSS-ленты ({rss_count}): {rss_line}.\n\n"
+        "Хотите добавить новый источник? Напишите нам об этом через /feedback!"
+    )
 
 
 def format_event(event):
@@ -622,6 +660,13 @@ async def cmd_stats(message: Message):
         await message.answer(NO_RIGHTS_TEXT)
         return
     await message.answer(stats_text())
+
+
+@dp.message(Command("sources"))
+async def cmd_sources(message: Message):
+    if not await check_allowed(message):
+        return
+    await message.answer(sources_text())
 
 
 @dp.message(Command("news"))
@@ -1011,6 +1056,8 @@ async def on_button(callback: CallbackQuery, state: FSMContext):
     elif action == "entity":
         # Имя для поиска кнопкой не передать — подсказываем, как написать команду
         text = ENTITY_HINT_TEXT
+    elif action == "sources":
+        text = sources_text()
     elif action == "research":
         # Вопрос кнопкой не передать — подсказываем, как написать команду
         text = RESEARCH_HINT_TEXT
@@ -1077,6 +1124,7 @@ async def run_bot():
         # Тот же порядок, что в справке /help
         BotCommand(command="news", description="📰 Последние новости (все подряд)"),
         BotCommand(command="top", description="🎯 Только самые важные новости"),
+        BotCommand(command="sources", description="📡 Откуда бот берёт новости"),
         BotCommand(command="btc", description="₿ Новости Bitcoin"),
         BotCommand(command="eth", description="💎 Новости Ethereum"),
         BotCommand(command="sol", description="☀️ Новости Solana"),
