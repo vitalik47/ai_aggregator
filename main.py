@@ -19,6 +19,7 @@ from agent_2_filter import run_filter
 from bot import run_bot
 from config import KEEP_DAYS
 from database import clean_old_events, init_db
+from instance_lock import acquire_instance_lock
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,8 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Вторая копия (например, start_bot.bat, открытый дважды) сразу завершится с понятным сообщением
+    acquire_instance_lock("main.py")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

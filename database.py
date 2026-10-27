@@ -15,7 +15,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import date
 
-from config import DATABASE_PATH
+from config import DATABASE_PATH, TRIAL_DAYS
 
 logger = logging.getLogger(__name__)
 
@@ -136,10 +136,15 @@ def init_db():
         )
         # last_context — последний текст новостей или ответа ИИ, отправленный пользователю (для /theory).
         # Колонка появилась позже, поэтому для старой базы добавляем её отдельно
+        # trial_end_date — конец пробного периода (UTC)
         user_columns = [row["name"] for row in conn.execute("PRAGMA table_info(users)")]
-        if "last_context" not in user_columns:
-            conn.execute("ALTER TABLE users ADD COLUMN last_context TEXT")
-            logger.info("В таблицу users добавлена колонка last_context")
+        for column, column_type in [
+            ("last_context", "TEXT"),
+            ("trial_end_date", "DATETIME"),
+        ]:
+            if column not in user_columns:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {column} {column_type}")
+                logger.info("В таблицу users добавлена колонка %s", column)
         # Пользователей, которые были до появления таблицы users, переносим из других таблиц.
         # Когда они пришли впервые — неизвестно, поэтому first_seen = NULL (в «новых сегодня» не попадут).
         # Эти таблицы уже созданы выше
@@ -148,6 +153,13 @@ def init_db():
                 f"INSERT OR IGNORE INTO users (user_id, first_seen, last_seen) "
                 f"SELECT DISTINCT user_id, NULL, NULL FROM {table} WHERE user_id IS NOT NULL"
             )
+        # Пользователи, пришедшие до появления пробного периода, получают полные TRIAL_DAYS с этого момента
+        started = conn.execute(
+            "UPDATE users SET trial_end_date = datetime('now', ?) WHERE trial_end_date IS NULL",
+            (f"+{TRIAL_DAYS} days",),
+        ).rowcount
+        if started:
+            logger.info("Пробный период на %d дн. начат для существующих пользователей: %d", TRIAL_DAYS, started)
     logger.info("База данных инициализирована: %s", DATABASE_PATH)
 
 
@@ -297,6 +309,20 @@ def get_events_by_entity(entity_name, limit=10):
     return events
 
 
+def get_recent_titles(hours=24, limit=80):
+    """Заголовки событий за последние hours часов (не больше limit, самые свежие) — для защиты от дублей."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT title FROM events
+            WHERE created_at >= datetime('now', ?)
+            ORDER BY created_at DESC, id DESC LIMIT ?
+            """,
+            (f"-{hours} hours", limit),
+        ).fetchall()
+    return [row["title"] for row in rows]
+
+
 def get_events_since(days=7):
     """Все события за последние days дней, от новых к старым."""
     with get_connection() as conn:
@@ -432,15 +458,38 @@ def save_feedback(user_id, is_interested, will_pay, suggestions):
 
 
 def register_user(user_id):
-    """Отмечает визит пользователя: новый — добавляется, у старого обновляется last_seen."""
+    """
+    Отмечает визит пользователя: у старого обновляется last_seen,
+    новый добавляется и сразу получает пробный период на TRIAL_DAYS дней.
+    Вызывается перед любой командой, поэтому триал начинается с первого сообщения (обычно это /start).
+    """
     with get_connection() as conn:
         conn.execute(
             """
-            INSERT INTO users (user_id) VALUES (?)
+            INSERT INTO users (user_id, trial_end_date) VALUES (?, datetime('now', ?))
             ON CONFLICT(user_id) DO UPDATE SET last_seen = CURRENT_TIMESTAMP
             """,
-            (user_id,),
+            (user_id, f"+{TRIAL_DAYS} days"),
         )
+
+
+def get_trial_end_date(user_id):
+    """
+    Конец пробного периода пользователя: "ГГГГ-ММ-ДД ЧЧ:ММ:СС" (UTC).
+    Пользователя нет в базе или у него нет даты (запись создана в обход register_user) — начинаем триал сейчас.
+    """
+    with get_connection() as conn:
+        row = conn.execute("SELECT trial_end_date FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None or row["trial_end_date"] is None:
+            conn.execute(
+                """
+                INSERT INTO users (user_id, trial_end_date) VALUES (?, datetime('now', ?))
+                ON CONFLICT(user_id) DO UPDATE SET trial_end_date = excluded.trial_end_date
+                """,
+                (user_id, f"+{TRIAL_DAYS} days"),
+            )
+            row = conn.execute("SELECT trial_end_date FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return row["trial_end_date"]
 
 
 def save_last_context(user_id, text):

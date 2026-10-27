@@ -3,7 +3,7 @@ Telegram-бот (aiogram 3).
 
 Команды:
 /start, /help — справка
-/news         — последние события из базы (без GPT, бесплатно)
+/news         — последние события из базы (без GPT; доступна и после пробного периода)
 /top          — 5 событий с самой высокой важностью insider_score (DeFi-новости получают бонус DEFI_PRIORITY_BONUS)
 /briefing     — главное за 24 часа от Агента №3 (доступна всем, даже при ALLOWED_USER_IDS)
 /defi, /btc, /eth, /sol — 5 последних новостей по теме (по тегам из category_tags)
@@ -19,6 +19,10 @@ Telegram-бот (aiogram 3).
                 Кнопка «Отменить» на каждом шаге; любая команда или кнопка меню тоже отменяет опрос
 /stats        — статистика (пользователи, запросы к ИИ) — только для ADMIN_ID из .env
 Любой текст   — вопрос Агенту №3 (текст с «/» — неизвестная команда, в ИИ не отправляется)
+
+Пробный период: новый пользователь получает TRIAL_DAYS дней полного доступа (users.trial_end_date).
+После него /top, /briefing, /research, /theory и вопросы к ИИ закрыты (check_access),
+а бот просит оставить отзыв (/feedback). Администратору доступно всё.
 
 Запросы к ИИ (вопросы, /briefing, /research, /theory и кнопки брифинга и справки) ограничены: DAILY_AI_LIMIT в день
 на пользователя (таблица user_limits).
@@ -53,7 +57,14 @@ from aiogram.types import (
 from agent_3_assistant import ERROR_TEXT, answer_question, make_briefing
 from agent_4_researcher import research_topic
 from agent_5_teacher import explain_term
-from config import ADMIN_ID, ALLOWED_USER_IDS, DAILY_AI_LIMIT, LANDING_URL, TELEGRAM_BOT_TOKEN
+from config import (
+    ADMIN_ID,
+    ALLOWED_USER_IDS,
+    DAILY_AI_LIMIT,
+    LANDING_URL,
+    TELEGRAM_BOT_TOKEN,
+    TRIAL_DAYS,
+)
 from database import (
     check_and_update_limit,
     get_ai_requests_today,
@@ -64,6 +75,7 @@ from database import (
     get_recent_events,
     get_sentiment_stats,
     get_total_users,
+    get_trial_end_date,
     get_user_preferences,
     init_db,
     register_user,
@@ -121,12 +133,9 @@ RESEARCH_TOO_LONG_TEXT = (
 COMMANDS_TEXT = (
     "📰 Новости\n"
     "/news — Последние новости (все подряд)\n"
-    "/top — Только самые важные новости (с высоким рейтингом)\n"
-    "/btc, /eth, /sol, /defi — Новости по теме\n\n"
+    "/top — Только самые важные новости (с высоким рейтингом)\n\n"
     "🧠 ИИ-Аналитика\n"
     "/briefing — Главное за 24 часа: ключевые события и тренд\n"
-    "/sentiment — Настроение рынка по теме (напр. /sentiment btc)\n"
-    f"/entity — Новости по монете, доступно {len(ALLOWED_ENTITIES)} активов (напр. /entity AAVE)\n"
     "/research — Подробный ответ на вопрос по крипте (напр. /research Что с Ethereum?)\n"
     "Или просто напишите вопрос, например: «Что нового с Bitcoin?»\n"
     f"(запросов к ИИ — до {DAILY_AI_LIMIT} в день)\n\n"
@@ -136,24 +145,34 @@ COMMANDS_TEXT = (
     "⚙️ Настройки\n"
     "/settings — Темы для брифинга (BTC, ETH, SOL, DeFi)\n"
     "/feedback — Оставить отзыв о боте\n"
-    "/help — Эта справка"
+    "/help — Эта справка\n\n"
+    "⏳ Доступ\n"
+    f"Всем новым пользователям дается {TRIAL_DAYS} дней полного доступа ко всем функциям."
 )
 
-# Приветствие на /start: коротко про бота + список команд
-START_TEXT = (
+# Приветствие на /start. Между приветствием и командами start_text() вставляет срок доступа —
+# так его видно сразу, а не в конце длинного списка
+START_GREETING = (
     "Привет! Я — Crypto Brief 42, твой ИИ-аналитик.\n"
-    "Я не просто собираю новости, я их читаю, анализирую и делаю выводы за тебя.\n\n"
-    f"{COMMANDS_TEXT}\n\n"
-    "👇 Или выбери ИИ-функцию ниже:"
+    "Я не просто собираю новости, я их читаю, анализирую и делаю выводы за тебя."
+)
+START_COMMANDS = f"{COMMANDS_TEXT}\n\n👇 Или выбери ИИ-функцию ниже:"
+
+# Справка: срок доступа help_text() вставляет сразу после заголовка
+HELP_TITLE = "📖 Справка Crypto Brief 42:"
+HELP_TEXT = f"{COMMANDS_TEXT}\n\n👇 Или нажмите кнопку:"
+# Этот блок видит в справке только администратор (ADMIN_ID)
+ADMIN_HELP_TEXT = (
+    "🔐 Для администратора\n"
+    "/stats — статистика бота\n\n"
 )
 
-HELP_TEXT = (
-    "📖 Справка Crypto Brief 42:\n\n"
-    f"{COMMANDS_TEXT}\n\n"
-    "👇 Или нажмите кнопку:"
+# Пробный период закончился: идёт тестирование, поэтому просим отзыв
+TRIAL_ENDED_TEXT = (
+    "🔒 Пробный период закончился. Спасибо, что тестировали бота! "
+    "Если вам был полезен этот инструмент, пожалуйста, оставьте отзыв через команду /feedback. "
+    "Это поможет нам сделать его лучше."
 )
-# Этот блок видит в справке только администратор (ADMIN_ID)
-ADMIN_HELP_TEXT = "🔐 Для администратора\n/stats — статистика бота\n\n"
 NO_RIGHTS_TEXT = "У вас нет прав"
 
 # Кнопки под /start и /help. callback_data — что именно нажали (обрабатывается в on_button).
@@ -188,10 +207,6 @@ MENU_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
         InlineKeyboardButton(text="📖 Учебная справка по DeFi", callback_data="theory"),
     ],
     [
-        # Заглушка: платная подписка появится позже (pro_button только отвечает «скоро»)
-        InlineKeyboardButton(text="💎 Купить Pro", callback_data="pro"),
-    ],
-    [
         InlineKeyboardButton(text="💬 Фидбек", callback_data="feedback"),
         InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"),
         InlineKeyboardButton(text="❓ Помощь", callback_data="help"),
@@ -224,10 +239,7 @@ RESEARCH_HINT_TEXT = (
 )
 
 NO_NEWS_TEXT = "Новостей пока нет. Подождите, пока агенты их соберут."
-LIMIT_TEXT = (
-    f"⚠️ Вы достигли дневного лимита бесплатных запросов к ИИ ({DAILY_AI_LIMIT}). "
-    "Лимит обновится завтра. В будущем можно будет оформить подписку для снятия ограничений."
-)
+LIMIT_TEXT = f"⚠️ Вы достигли дневного лимита запросов к ИИ ({DAILY_AI_LIMIT}). Лимит обновится завтра."
 # Названия месяцев в родительном падеже для даты «20 октября 2026».
 # strftime("%B") зависит от языка Windows, поэтому пишем их сами
 MONTHS = [
@@ -251,12 +263,55 @@ def is_allowed(user_id):
     return not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS or is_admin(user_id)
 
 
+def parse_utc(value):
+    """'2026-11-02 16:30:00' (UTC, как в базе) -> datetime с часовым поясом UTC."""
+    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def check_access(user_id):
+    """
+    Есть ли полный доступ.
+    True — администратор или пробный период ещё идёт; False — триал закончился.
+    """
+    if is_admin(user_id):
+        return True
+    return datetime.now(timezone.utc) < parse_utc(get_trial_end_date(user_id))
+
+
+def access_status_text(user_id):
+    """Строка о доступе пользователя для /start и /help."""
+    if is_admin(user_id):
+        return "🔐 Вы администратор: доступ ко всем функциям без ограничений."
+    trial_end_date = get_trial_end_date(user_id)
+    left = parse_utc(trial_end_date) - datetime.now(timezone.utc)
+    if left.total_seconds() <= 0:
+        return "🔒 Пробный период закончился. Будем рады вашему отзыву: /feedback"
+    # Округляем вверх: осталось 6 дней и 2 часа -> «7 дн.»
+    days_left = left.days + (1 if left.seconds else 0)
+    return f"⏳ Пробный период до {format_date(trial_end_date)} (осталось дней: {days_left})"
+
+
+async def trial_ok(message: Message, user_id):
+    """Проверка пробного периода перед платной функцией: если он закончился — отвечает и возвращает False."""
+    if check_access(user_id):
+        return True
+    logger.info("Пробный период закончился: user_id=%s", user_id)
+    await message.answer(TRIAL_ENDED_TEXT)
+    return False
+
+
+def start_text(user_id):
+    """Приветствие: сразу после него — срок доступа пользователя, потом команды."""
+    return f"{START_GREETING}\n\n{access_status_text(user_id)}\n\n{START_COMMANDS}"
+
+
 def help_text(user_id):
-    """Справка: администратору дополнительно показываем блок с /stats."""
-    if not is_admin(user_id):
-        return HELP_TEXT
-    footer = "👇 Или нажмите кнопку:"
-    return HELP_TEXT.replace(footer, ADMIN_HELP_TEXT + footer)
+    """Справка: срок доступа — сразу под заголовком; администратору — ещё блок его команд перед кнопками."""
+    text = f"{HELP_TITLE}\n\n{access_status_text(user_id)}\n\n{HELP_TEXT}"
+    if is_admin(user_id):
+        footer = "👇 Или нажмите кнопку:"
+        text = text.replace(footer, ADMIN_HELP_TEXT + footer)
+    return text
 
 
 def menu_keyboard(user_id):
@@ -285,7 +340,7 @@ async def track_user(handler, event, data):
     return await handler(event, data)
 
 
-async def check_access(message: Message):
+async def check_allowed(message: Message):
     """Проверка доступа для команд: при отказе отвечает пользователю."""
     if is_allowed(message.from_user.id):
         return True
@@ -544,15 +599,16 @@ async def briefing_text(user_id):
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     """Приветствие ИИ-аналитика и меню кнопок."""
-    if not await check_access(message):
+    if not await check_allowed(message):
         return
-    await message.answer(START_TEXT, reply_markup=menu_keyboard(message.from_user.id))
+    user_id = message.from_user.id
+    await message.answer(start_text(user_id), reply_markup=menu_keyboard(user_id))
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     """Полный список команд и то же меню кнопок."""
-    if not await check_access(message):
+    if not await check_allowed(message):
         return
     user_id = message.from_user.id
     await message.answer(help_text(user_id), reply_markup=menu_keyboard(user_id))
@@ -570,7 +626,7 @@ async def cmd_stats(message: Message):
 
 @dp.message(Command("news"))
 async def cmd_news(message: Message):
-    if not await check_access(message):
+    if not await check_allowed(message):
         return
     text = news_text()
     remember_context(message.from_user.id, text)
@@ -579,7 +635,9 @@ async def cmd_news(message: Message):
 
 @dp.message(Command("top"))
 async def cmd_top(message: Message):
-    if not await check_access(message):
+    if not await check_allowed(message):
+        return
+    if not await trial_ok(message, message.from_user.id):
         return
     text = top_text()
     remember_context(message.from_user.id, text)
@@ -588,8 +646,10 @@ async def cmd_top(message: Message):
 
 @dp.message(Command("briefing"))
 async def cmd_briefing(message: Message):
-    # Без check_access: брифинг пока бесплатный и доступен всем
+    # Без check_allowed: брифинг доступен всем, даже при ALLOWED_USER_IDS (но только в пробный период)
     logger.info("Брифинг для user_id=%s", message.from_user.id)
+    if not await trial_ok(message, message.from_user.id):
+        return
     if not ai_limit_ok(message.from_user.id):
         await message.answer(LIMIT_TEXT)
         return
@@ -602,7 +662,9 @@ async def cmd_briefing(message: Message):
 @dp.message(Command("research"))
 async def cmd_research(message: Message, command: CommandObject):
     """/research вопрос — развёрнутый ответ Агента №4 по новостям за 7 дней."""
-    if not await check_access(message):
+    if not await check_allowed(message):
+        return
+    if not await trial_ok(message, message.from_user.id):
         return
     question = (command.args or "").strip()
     if not question:
@@ -625,7 +687,7 @@ async def cmd_research(message: Message, command: CommandObject):
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message):
-    # Без check_access: темы влияют на /briefing, а он доступен всем
+    # Без check_allowed: темы влияют на /briefing, а он доступен всем
     topics = user_topics(message.from_user.id)
     await message.answer(settings_text(topics), reply_markup=settings_keyboard(topics))
 
@@ -633,7 +695,7 @@ async def cmd_settings(message: Message):
 @dp.message(Command(*TAG_COMMANDS))
 async def cmd_by_tag(message: Message, command: CommandObject):
     """Один обработчик для /defi, /btc, /eth, /sol — отличается только тег."""
-    if not await check_access(message):
+    if not await check_allowed(message):
         return
     await send_long(message, tag_text(command.command.lower()))
 
@@ -641,7 +703,7 @@ async def cmd_by_tag(message: Message, command: CommandObject):
 @dp.message(Command("sentiment"))
 async def cmd_sentiment(message: Message, command: CommandObject):
     """/sentiment btc — доля позитивных, негативных и нейтральных новостей по теме за 24 часа."""
-    if not await check_access(message):
+    if not await check_allowed(message):
         return
     await message.answer(sentiment_text(command.args or ""))
 
@@ -649,7 +711,7 @@ async def cmd_sentiment(message: Message, command: CommandObject):
 @dp.message(Command("entity"))
 async def cmd_entity(message: Message, command: CommandObject):
     """/entity AAVE — новости про актив из ALLOWED_ENTITIES."""
-    if not await check_access(message):
+    if not await check_allowed(message):
         return
     logger.info("Поиск сущности '%s' от user_id=%s", command.args, message.from_user.id)
     await send_long(message, entity_text(command.args or ""))
@@ -736,7 +798,7 @@ async def leave_feedback(handler, event, data):
 
 @dp.message(Command("feedback"))
 async def cmd_feedback(message: Message, state: FSMContext):
-    # Без check_access: отзыв может оставить любой
+    # Без check_allowed: отзыв может оставить любой
     await start_feedback(message, state)
 
 
@@ -797,7 +859,7 @@ async def feedback_suggestions(message: Message, state: FSMContext):
             )
         except TelegramBadRequest:
             pass
-    await message.answer("Спасибо! Ваше мнение очень важно для нас. 🙏")
+    await message.answer("Спасибо за отзыв! Это очень помогает нам делать бота лучше.")
 
 
 # ============================================================
@@ -835,6 +897,8 @@ async def send_theory(message: Message, user_id, term=""):
     Справка по термину: term — из команды (/theory AMM), без него — самый сложный термин из last_context.
     Ровно один запрос к GPT, ответ ограничен MAX_ANSWER_TOKENS (agent_5_teacher.py).
     """
+    if not await trial_ok(message, user_id):
+        return
     context = "" if term else get_last_context(user_id)
     logger.info("Справка для user_id=%s: термин %r, last_context %d символов", user_id, term, len(context))
     if not term and not context:
@@ -855,7 +919,7 @@ async def send_theory(message: Message, user_id, term=""):
 
 @dp.message(Command("theory"))
 async def cmd_theory(message: Message, command: CommandObject):
-    if not await check_access(message):
+    if not await check_allowed(message):
         return
     term = (command.args or "").strip()
     if len(term) > MAX_RESEARCH_LENGTH:
@@ -881,13 +945,6 @@ async def theory_button(callback: CallbackQuery):
 )
 async def theory_old_button(callback: CallbackQuery):
     await callback.answer(f"Эта кнопка устарела. Нажмите «{THEORY_TITLE}» в меню: /start", show_alert=True)
-
-
-@dp.callback_query(F.data == "pro")
-async def pro_button(callback: CallbackQuery):
-    """«💎 Купить Pro» — заглушка: платная подписка появится позже."""
-    # Без callback.answer() на кнопке крутились бы «часики»
-    await callback.answer("💎 Pro скоро появится")
 
 
 # ============================================================
@@ -934,6 +991,10 @@ async def on_button(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     logger.info("Кнопка %s от user_id=%s", callback.data, callback.from_user.id)
     message = callback.message
+
+    # Те же функции, что закрыты после пробного периода у команд /top и /briefing
+    if action in ("top", "briefing", "digest") and not await trial_ok(message, user_id):
+        return
 
     if action == "news":
         text = news_text()
@@ -986,11 +1047,13 @@ UNKNOWN_COMMAND_TEXT = "Такой команды нет. Список кома�
 @dp.message(F.text)
 async def handle_question(message: Message):
     """Любой обычный текст считаем вопросом к ассистенту."""
-    if not await check_access(message):
+    if not await check_allowed(message):
         return
     # Неизвестная или удалённая команда (например, /digest) — не тратим на неё запрос к ИИ
     if message.text.startswith("/"):
         await message.answer(UNKNOWN_COMMAND_TEXT)
+        return
+    if not await trial_ok(message, message.from_user.id):
         return
     if not ai_limit_ok(message.from_user.id):
         await message.answer(LIMIT_TEXT)
@@ -1029,16 +1092,18 @@ async def run_bot():
     ]
     await bot.set_my_commands(commands)
 
-    # Администратору в его чате с ботом дополнительно показываем /stats
+    # Администратору в его чате с ботом дополнительно показываем команды администратора
     if ADMIN_ID:
         try:
             await bot.set_my_commands(
-                commands + [BotCommand(command="stats", description="📈 Статистика бота (админ)")],
+                commands + [
+                    BotCommand(command="stats", description="📈 Статистика бота (админ)"),
+                ],
                 scope=BotCommandScopeChat(chat_id=ADMIN_ID),
             )
         except TelegramBadRequest:
             # Например, администратор ещё ни разу не писал боту
-            logger.warning("Не удалось показать /stats в меню администратора (ADMIN_ID=%s)", ADMIN_ID)
+            logger.warning("Не удалось показать команды администратора в его меню (ADMIN_ID=%s)", ADMIN_ID)
 
     if not ALLOWED_USER_IDS:
         logger.warning("ALLOWED_USER_IDS не задан — ботом может пользоваться кто угодно")
@@ -1051,6 +1116,8 @@ async def run_bot():
 
 if __name__ == "__main__":
     # Запуск только бота (без сборщика и фильтра) — для проверки
+    from instance_lock import acquire_instance_lock
+    acquire_instance_lock("bot.py")
     init_db()
     try:
         asyncio.run(run_bot())

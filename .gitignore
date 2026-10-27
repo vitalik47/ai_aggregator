@@ -29,3 +29,5 @@ app.log
 # OS
 .DS_Store
 Thumbs.db
+# Замок от двойного запуска (instance_lock.py)
+*.lock

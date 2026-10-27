@@ -24,7 +24,14 @@ NO_EVENTS_TEXT = "В базе пока нет новостей. Подождит
 ERROR_TEXT = "Не получилось получить ответ от ИИ. Попробуйте чуть позже."
 NO_TOPIC_EVENTS_TEXT = "По вашим темам за 24 часа новостей не найдено"
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# Пользователь ждёт ответа в чате: не дольше 30 секунд и один повтор
+# (по умолчанию OpenAI ждёт до 10 минут и повторяет дважды — бот выглядел бы зависшим)
+OPENAI_TIMEOUT = 30
+client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT, max_retries=1)
+
+
+class EmptyAnswerError(OpenAIError):
+    """GPT вернул пустой ответ (например, сработал фильтр контента)."""
 
 QUESTION_PROMPT = """You are a crypto news assistant inside a Telegram bot.
 Answer the user's question using ONLY the news events listed below.
@@ -68,7 +75,12 @@ def format_events(events):
 
 
 async def ask_gpt(system_prompt, user_text, max_tokens=None):
-    """Один запрос к GPT. Возвращает текст ответа. max_tokens — жёсткий потолок длины ответа."""
+    """
+    Один запрос к GPT. Возвращает текст ответа. max_tokens — жёсткий потолок длины ответа.
+    Пустой ответ -> EmptyAnswerError. Это подкласс OpenAIError, поэтому все агенты
+    обрабатывают его так же, как недоступность OpenAI: пользователь получает ERROR_TEXT,
+    а не пустое сообщение (его Telegram не принимает — была бы ошибка в обработчике).
+    """
     # Без потолка параметр не передаём вовсе — запросы других агентов остаются как раньше
     extra = {"max_completion_tokens": max_tokens} if max_tokens else {}
     response = await client.chat.completions.create(
@@ -79,7 +91,12 @@ async def ask_gpt(system_prompt, user_text, max_tokens=None):
         ],
         **extra,
     )
-    return response.choices[0].message.content.strip()
+    answer = (response.choices[0].message.content or "").strip() if response.choices else ""
+    if not answer:
+        finish_reason = response.choices[0].finish_reason if response.choices else None
+        logger.warning("GPT вернул пустой ответ (finish_reason=%s)", finish_reason)
+        raise EmptyAnswerError(f"Пустой ответ GPT (finish_reason={finish_reason})")
+    return answer
 
 
 async def answer_question(question):

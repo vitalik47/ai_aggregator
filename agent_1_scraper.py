@@ -2,7 +2,8 @@
 Агент №1: Сборщик.
 
 Собирает сообщения из двух типов источников и сохраняет их в таблицу raw_messages:
-- Telegram-каналы (TARGET_CHANNELS) — слушает новые сообщения в реальном времени через Telethon;
+- Telegram-каналы (TARGET_CHANNELS) — раз в TELEGRAM_CHECK_INTERVAL секунд читает последние посты
+  через Telethon (client.get_messages); подписка на публичный канал для этого не нужна;
 - RSS-ленты сайтов (TARGET_WEBSITES) — опрашивает раз в RSS_CHECK_INTERVAL секунд.
 
 Важно: Telethon работает от имени вашего ЛИЧНОГО аккаунта (не бота),
@@ -22,7 +23,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 import feedparser
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 
 from config import BASE_DIR, KEEP_DAYS, TARGET_CHANNELS, TARGET_WEBSITES, TELEGRAM_API_HASH, TELEGRAM_API_ID
 from database import init_db, message_exists, save_raw_message
@@ -33,6 +34,11 @@ logger = logging.getLogger(__name__)
 RSS_CHECK_INTERVAL = 300
 # Файл сессии Telethon (будет создан scraper.session в папке проекта)
 SESSION_PATH = os.path.join(BASE_DIR, "scraper")
+# Как часто читать Telegram-каналы (в секундах) и сколько последних постов брать из каждого
+TELEGRAM_CHECK_INTERVAL = 300
+TELEGRAM_FETCH_LIMIT = 20
+# Посты старше этого не сохраняем: иначе при первом запуске старые новости попали бы в ленту как свежие
+TELEGRAM_MAX_AGE_HOURS = 24
 # Слишком короткие сообщения (стикеры, "👍", пустые подписи к фото) не сохраняем
 MIN_TEXT_LENGTH = 20
 
@@ -164,33 +170,62 @@ async def init_telegram_client():
     return client
 
 
-async def telegram_listener():
-    """Подключается к Telegram и сохраняет каждое новое сообщение из TARGET_CHANNELS."""
+def channel_username(channel):
+    """
+    Username канала без @. У каналов с купленным (коллекционным) именем, например @crypto,
+    поле username пустое, а имя лежит в списке usernames.
+    """
+    if getattr(channel, "username", None):
+        return channel.username
+    active = [u.username for u in getattr(channel, "usernames", None) or [] if u.active]
+    return active[0] if active else None
+
+
+async def fetch_channel(client, channel):
+    """Читает последние посты канала и сохраняет новые. Возвращает количество новых сообщений."""
+    username = channel_username(channel)
+    source = f"@{username}" if username else str(channel.id)
+    since = time.time() - TELEGRAM_MAX_AGE_HOURS * 3600
+    new_count = 0
+
+    # get_messages отдаёт посты от новых к старым — сохраняем по порядку публикации
+    for post in reversed(await client.get_messages(channel, limit=TELEGRAM_FETCH_LIMIT)):
+        text = (post.raw_text or "").strip()
+        # Пропускаем короткое (фото без подписи, стикеры), старое и уже сохранённое
+        if len(text) < MIN_TEXT_LENGTH or post.date.timestamp() < since or message_exists(source, text):
+            continue
+        # Ссылка на пост: https://t.me/<канал>/<номер сообщения> (у закрытых каналов без username её нет)
+        post_url = f"https://t.me/{username}/{post.id}" if username else None
+        save_raw_message("telegram", source, text, url=post_url)
+        new_count += 1
+    return new_count
+
+
+async def telegram_loop():
+    """
+    Раз в TELEGRAM_CHECK_INTERVAL читает последние посты каждого канала из TARGET_CHANNELS.
+    Раньше бот ждал уведомлений о новых постах (events.NewMessage), но Telegram присылает их
+    только по каналам, на которые аккаунт подписан, — без подписки не приходило ничего.
+    get_messages читает публичный канал и без подписки.
+    """
     client = await init_telegram_client()
 
     channels = await resolve_channels(client)
     if not channels:
-        logger.error("Ни один Telegram-канал не найден — слушать нечего")
+        logger.error("Ни один Telegram-канал не найден — читать нечего")
         await client.disconnect()
         return
 
-    @client.on(events.NewMessage(chats=channels))
-    async def on_new_message(event):
-        text = (event.raw_text or "").strip()
-        if len(text) < MIN_TEXT_LENGTH:
-            return
-
-        chat = await event.get_chat()
-        username = getattr(chat, "username", None)
-        source = f"@{username}" if username else str(event.chat_id)
-        # Ссылка на пост: https://t.me/<канал>/<номер сообщения> (у закрытых каналов без username её нет)
-        post_url = f"https://t.me/{username}/{event.id}" if username else None
-
-        save_raw_message("telegram", source, text, url=post_url)
-        logger.info("Новое сообщение из %s", source)
-
-    logger.info("Слушаю Telegram-каналов: %d", len(channels))
-    await client.run_until_disconnected()
+    logger.info("Читаю Telegram-каналов: %d (раз в %d сек.)", len(channels), TELEGRAM_CHECK_INTERVAL)
+    while True:
+        for channel in channels:
+            try:
+                new_count = await fetch_channel(client, channel)
+                logger.info("Telegram @%s: новых сообщений %d", channel_username(channel), new_count)
+            except Exception:
+                # Ошибка одного канала не должна останавливать сборщик
+                logger.exception("Не удалось прочитать канал @%s", channel_username(channel))
+        await asyncio.sleep(TELEGRAM_CHECK_INTERVAL)
 
 
 # ============================================================
@@ -200,11 +235,13 @@ async def telegram_listener():
 async def run_scraper():
     """Главная функция агента: Telegram и RSS работают параллельно."""
     logger.info("Агент №1 (сборщик) запущен")
-    await asyncio.gather(telegram_listener(), rss_loop())
+    await asyncio.gather(telegram_loop(), rss_loop())
 
 
 if __name__ == "__main__":
     # Запуск агента отдельно от остального проекта (для проверки и первого входа в Telegram)
+    from instance_lock import acquire_instance_lock
+    acquire_instance_lock("agent_1_scraper.py")
     init_db()
     try:
         asyncio.run(run_scraper())

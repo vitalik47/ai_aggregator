@@ -40,6 +40,8 @@ DAILY_AI_LIMIT = int(_daily_limit) if _daily_limit.isdigit() else 15
 # Telegram id администратора (команда /stats). Не задан — /stats недоступна никому
 _admin_id = (os.getenv("ADMIN_ID") or "").strip()
 ADMIN_ID = int(_admin_id) if _admin_id.isdigit() else None
+# Пробный период: столько дней полного доступа получает каждый новый пользователь
+TRIAL_DAYS = 7
 
 # Сайт с материалами (учебник, симулятор DeFi Compass). Полную ссылку можно задать в .env
 LANDING_URL = os.getenv("LANDING_URL") or "https://spectrum-gerbera-694.notion.site/"
@@ -61,12 +63,19 @@ TARGET_WEBSITES = [
     "https://cointelegraph.com/rss/tag/defi",
     "https://cointelegraph.com/rss/tag/solana",
 ]
+# Публичные новостные каналы (проверено 27.10.2026: существуют и пишут новости).
+# Убраны: @solana (не существует), @ethereum (это не канал, а личный аккаунт),
+# @defi_news (последний пост в 2019 году)
 TARGET_CHANNELS = [
     "@cointelegraph",
-    "@coindesk",
-    "@solana",
-    "@ethereum",
-    "@defi_news"
+    "@coindesk",  # сомнительный: последний пост в июле 2026
+    "@crypto",
+    "@WatcherGuru",
+    "@whale_alert_io",
+    "@the_block_crypto",
+    "@wublockchainenglish",
+    "@forklog",
+    "@incrypted",
 ]
 # --- Настройка логирования ---
 def setup_logging():

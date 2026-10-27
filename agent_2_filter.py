@@ -14,7 +14,7 @@ import logging
 from openai import AsyncOpenAI, OpenAIError
 
 from config import OPENAI_API_KEY, OPENAI_MODEL
-from database import get_unprocessed_messages, init_db, mark_as_processed, save_event
+from database import get_recent_titles, get_unprocessed_messages, init_db, mark_as_processed, save_event
 
 logger = logging.getLogger(__name__)
 
@@ -33,18 +33,31 @@ SENTIMENTS = ["positive", "negative", "neutral"]
 # Сколько сущностей максимум сохраняем у одной новости
 MAX_ENTITIES = 10
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# Фильтр работает в фоне, пачка из 20 сообщений может обрабатываться долго — ждём до 2 минут.
+# При ошибке пачка не теряется: фильтр повторит её через FILTER_INTERVAL
+client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=120, max_retries=1)
 
-SYSTEM_PROMPT = f"""You are a crypto news analyst. You receive a JSON list of raw messages
-collected from Telegram channels and RSS feeds. Each message has "id", "source" and "text".
+# Защита от дублей: заголовки уже сохранённых новостей за столько часов отправляем в GPT
+DEDUP_HOURS = 24
+# ...но не больше стольких (самые свежие) — около 25 токенов на заголовок
+DEDUP_MAX_TITLES = 80
+
+SYSTEM_PROMPT = f"""You are a crypto news analyst. You receive a JSON object with two fields:
+- "messages": raw messages collected from Telegram channels and RSS feeds.
+  Each message has "id", "source" and "text".
+- "already_published": news events already published in the last {DEDUP_HOURS} hours,
+  each with "n" (number) and "title" (headline in Russian).
 
 Your tasks:
 1. Drop noise: ads, promos, giveaways, referral links, memes, greetings,
    channel self-promotion, bare price tickers without any news.
 2. If several messages describe the same news, merge them into ONE event.
-3. For every real news event return:
+3. Return an event for EVERY real news story, including ones that look already published —
+   do not drop news yourself because of "already_published", mark it instead (see "duplicate_of").
+4. For every real news event return:
    - "title": short headline in Russian, max 100 characters
-   - "summary": 2-3 sentences in Russian with the key facts
+     (ALWAYS translate to Russian, even when the message is in English)
+   - "summary": 2-3 sentences in Russian with the key facts (ALWAYS in Russian)
    - "category": one of {CATEGORIES}
    - "insider_score": integer, the importance of the news for the crypto market.
      Rate importance from 1 to 10.
@@ -66,18 +79,31 @@ Your tasks:
      Use full names for coins and projects ("Bitcoin", not "BTC").
      Do not include generic words like "crypto", "market", "investors".
    - "message_ids": list of ids of the messages this event is based on
+   - "duplicate_of": the "n" of the already_published item that reports the SAME event
+     (the same fact: same company + same action + same numbers, even if worded differently
+      or from another source), or null if there is no such item.
+     Different events about the same company or coin are NOT duplicates — use null.
 
 Respond ONLY with JSON in this format:
-{{"events": [{{"title": "...", "summary": "...", "category": "...", "insider_score": <integer 1-10>, "tags": ["bitcoin"], "sentiment": "neutral", "entities": ["BlackRock", "Bitcoin", "Larry Fink"], "message_ids": [1, 2]}}]}}
+{{"events": [{{"title": "...", "summary": "...", "category": "...", "insider_score": <integer 1-10>, "tags": ["bitcoin"], "sentiment": "neutral", "entities": ["BlackRock", "Bitcoin", "Larry Fink"], "message_ids": [1, 2], "duplicate_of": null}}]}}
 If there is no real news, respond with {{"events": []}}."""
 
 
-async def analyze_messages(messages):
-    """Отправляет пачку сообщений в GPT и возвращает список событий (словари)."""
-    payload = [
-        {"id": m["id"], "source": m["source"], "text": m["text"][:MAX_TEXT_CHARS]}
-        for m in messages
-    ]
+async def analyze_messages(messages, published_titles=()):
+    """
+    Отправляет пачку сообщений в GPT и возвращает список НОВЫХ событий (словари).
+    published_titles — заголовки уже сохранённых новостей. GPT отмечает повтор полем duplicate_of
+    (номер такого заголовка), а выбрасываем повторы мы сами: просьбу «не возвращай дубли»
+    gpt-4o-mini выполнял плохо — пропускал дубли и выбрасывал настоящие новости.
+    """
+    published_titles = list(published_titles)
+    payload = {
+        "messages": [
+            {"id": m["id"], "source": m["source"], "text": m["text"][:MAX_TEXT_CHARS]}
+            for m in messages
+        ],
+        "already_published": [{"n": n, "title": title} for n, title in enumerate(published_titles, start=1)],
+    }
     response = await client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
@@ -86,8 +112,25 @@ async def analyze_messages(messages):
         ],
         response_format={"type": "json_object"},
     )
-    data = json.loads(response.choices[0].message.content)
-    return data.get("events", [])
+    # Пустой ответ превратится в JSONDecodeError — пачка будет пропущена, а не повторяться бесконечно
+    data = json.loads(response.choices[0].message.content or "")
+    events = data.get("events", []) if isinstance(data, dict) else []
+    if not isinstance(events, list):
+        return []
+
+    fresh = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        duplicate_of = event.get("duplicate_of")
+        # Учитываем только настоящий номер из списка; мусор вместо номера — считаем новостью
+        if isinstance(duplicate_of, int) and 1 <= duplicate_of <= len(published_titles):
+            logger.info(
+                "Дубль пропущен: «%s» = уже было «%s»", event.get("title"), published_titles[duplicate_of - 1]
+            )
+            continue
+        fresh.append(event)
+    return fresh
 
 
 def save_events(events, messages):
@@ -164,10 +207,11 @@ async def run_filter_once():
         return 0
 
     ids = [m["id"] for m in messages]
-    logger.info("Фильтрую сообщений: %d", len(messages))
+    published_titles = get_recent_titles(hours=DEDUP_HOURS, limit=DEDUP_MAX_TITLES)
+    logger.info("Фильтрую сообщений: %d (для проверки дублей заголовков: %d)", len(messages), len(published_titles))
 
     try:
-        events = await analyze_messages(messages)
+        events = await analyze_messages(messages, published_titles)
     except OpenAIError:
         # Ошибка сети или API — сообщения НЕ помечаем, попробуем в следующий раз
         logger.exception("Ошибка OpenAI API, повторю позже")
@@ -198,6 +242,8 @@ async def run_filter():
 
 if __name__ == "__main__":
     # Запуск агента отдельно от остального проекта (для проверки)
+    from instance_lock import acquire_instance_lock
+    acquire_instance_lock("agent_2_filter.py")
     init_db()
     try:
         asyncio.run(run_filter())
