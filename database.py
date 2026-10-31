@@ -8,6 +8,7 @@
 - user_limits  — дневной лимит запросов к ИИ для каждого пользователя
 - feedback     — ответы пользователей на опрос /feedback
 - users        — все пользователи бота и дата первого визита (для /stats)
+- payments     — оплаченные счета Crypto Bot (/subscribe); каждый счёт продлевает доступ только один раз
 """
 
 import logging
@@ -123,6 +124,18 @@ def init_db():
             """
         )
 
+        # Оплаченные счета: invoice_id — PRIMARY KEY, поэтому повторное «Я оплатил» не продлит доступ дважды
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payments (
+                invoice_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                plan TEXT,
+                paid_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
         # Все, кто хоть раз писал боту или нажимал кнопку (для /stats).
         # first_seen и last_seen — в UTC, как created_at в events
         conn.execute(
@@ -136,11 +149,12 @@ def init_db():
         )
         # last_context — последний текст новостей или ответа ИИ, отправленный пользователю (для /theory).
         # Колонка появилась позже, поэтому для старой базы добавляем её отдельно
-        # trial_end_date — конец пробного периода (UTC)
+        # trial_end_date — конец пробного периода (UTC), paid_until — конец оплаченной подписки (UTC)
         user_columns = [row["name"] for row in conn.execute("PRAGMA table_info(users)")]
         for column, column_type in [
             ("last_context", "TEXT"),
             ("trial_end_date", "DATETIME"),
+            ("paid_until", "DATETIME"),
         ]:
             if column not in user_columns:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {column} {column_type}")
@@ -490,6 +504,40 @@ def get_trial_end_date(user_id):
             )
             row = conn.execute("SELECT trial_end_date FROM users WHERE user_id = ?", (user_id,)).fetchone()
     return row["trial_end_date"]
+
+
+def get_paid_until(user_id):
+    """Конец оплаченной подписки "ГГГГ-ММ-ДД ЧЧ:ММ:СС" (UTC) или None, если пользователь не платил."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT paid_until FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return row["paid_until"] if row else None
+
+
+def activate_subscription(invoice_id, user_id, plan, days):
+    """
+    Засчитывает оплаченный счёт: продлевает доступ на days дней.
+    Отсчёт — от самой поздней даты из «сейчас», конца подписки и конца пробного периода,
+    чтобы оплаченные дни не сгорали. Возвращает новый paid_until или None, если счёт уже был засчитан.
+    """
+    with get_connection() as conn:
+        inserted = conn.execute(
+            "INSERT OR IGNORE INTO payments (invoice_id, user_id, plan) VALUES (?, ?, ?)",
+            (str(invoice_id), user_id, plan),
+        ).rowcount
+        if not inserted:
+            return None
+        # Даты в базе — строки "ГГГГ-ММ-ДД ЧЧ:ММ:СС", их можно сравнивать как текст; NULL -> ''
+        conn.execute(
+            """
+            UPDATE users SET paid_until = datetime(
+                max(datetime('now'), coalesce(paid_until, ''), coalesce(trial_end_date, '')), ?
+            ) WHERE user_id = ?
+            """,
+            (f"+{days} days", user_id),
+        )
+        row = conn.execute("SELECT paid_until FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    logger.info("Подписка %s по счёту %s: user_id=%s, доступ до %s", plan, invoice_id, user_id, row["paid_until"])
+    return row["paid_until"]
 
 
 def save_last_context(user_id, text):

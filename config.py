@@ -20,6 +20,8 @@ TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# Токен приложения Crypto Pay (@CryptoBot) для оплаты подписки. Не задан — оплата работает в тестовом режиме
+CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN")
 
 # --- Необязательные настройки (есть значения по умолчанию) ---
 # "or" нужен, чтобы пустая строка в .env тоже заменялась на значение по умолчанию

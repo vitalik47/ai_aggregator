@@ -20,11 +20,14 @@ Telegram-бот (aiogram 3).
                 Кнопка «Отменить» на каждом шаге; любая команда или кнопка меню тоже отменяет опрос
 /stats        — статистика (пользователи, запросы к ИИ) — только для ADMIN_ID из .env
 /feedbacks    — сводка и последние отзывы из /feedback — только для ADMIN_ID, скрыта из справки и меню
+/subscribe    — подписка: кнопки «Месяц — 5 USDT» и «Год — 50 USDT», счёт через Crypto Bot (payment.py).
+                Кнопка «Я оплатил» проверяет счёт и продлевает доступ (users.paid_until).
+                Без CRYPTO_BOT_TOKEN — тестовый режим, доступный только администратору
 Любой текст   — вопрос Агенту №3 (текст с «/» — неизвестная команда, в ИИ не отправляется)
 
 Пробный период: новый пользователь получает TRIAL_DAYS дней полного доступа (users.trial_end_date).
 После него /top, /briefing, /research, /theory и вопросы к ИИ закрыты (check_access),
-а бот просит оставить отзыв (/feedback). Администратору доступно всё.
+пока нет оплаченной подписки (users.paid_until), а бот предлагает /subscribe и /feedback. Администратору доступно всё.
 
 Запросы к ИИ (вопросы, /briefing, /research, /theory и кнопки брифинга и справки) ограничены: DAILY_AI_LIMIT в день
 на пользователя (таблица user_limits).
@@ -59,9 +62,11 @@ from aiogram.types import (
 from agent_3_assistant import ERROR_TEXT, answer_question, make_briefing
 from agent_4_researcher import research_topic
 from agent_5_teacher import explain_term
+from payment import ASSET, PLANS, check_payment, create_invoice
 from config import (
     ADMIN_ID,
     ALLOWED_USER_IDS,
+    CRYPTO_BOT_TOKEN,
     DAILY_AI_LIMIT,
     LANDING_URL,
     TARGET_CHANNELS,
@@ -70,6 +75,7 @@ from config import (
     TRIAL_DAYS,
 )
 from database import (
+    activate_subscription,
     check_and_update_limit,
     get_ai_requests_today,
     get_events_by_entity,
@@ -78,6 +84,7 @@ from database import (
     get_feedbacks,
     get_last_context,
     get_new_users_today,
+    get_paid_until,
     get_recent_events,
     get_sentiment_stats,
     get_total_users,
@@ -151,6 +158,7 @@ COMMANDS_TEXT = (
     f"Учебник и симулятор DeFi Compass — скоро на сайте: {LANDING_URL}\n\n"
     "⚙️ Настройки\n"
     "/settings — Темы для брифинга (BTC, ETH, SOL, DeFi)\n"
+    "/subscribe — Подписка (оплата в USDT через @CryptoBot)\n"
     "/feedback — Оставить отзыв о боте\n"
     "/help — Эта справка\n\n"
     "⏳ Доступ\n"
@@ -176,9 +184,9 @@ ADMIN_HELP_TEXT = (
 
 # Пробный период закончился: идёт тестирование, поэтому просим отзыв
 TRIAL_ENDED_TEXT = (
-    "🔒 Пробный период закончился. Спасибо, что тестировали бота! "
-    "Если вам был полезен этот инструмент, пожалуйста, оставьте отзыв через команду /feedback. "
-    "Это поможет нам сделать его лучше."
+    "🔒 Пробный период закончился. Спасибо, что тестировали бота!\n\n"
+    "💳 Чтобы продолжить пользоваться всеми функциями, оформите подписку: /subscribe\n"
+    "Отзыв о боте можно оставить через /feedback — это поможет нам сделать его лучше."
 )
 NO_RIGHTS_TEXT = "У вас нет прав"
 
@@ -279,21 +287,32 @@ def parse_utc(value):
 def check_access(user_id):
     """
     Есть ли полный доступ.
-    True — администратор или пробный период ещё идёт; False — триал закончился.
+    True — администратор, пробный период ещё идёт или есть оплаченная подписка; иначе False.
     """
     if is_admin(user_id):
         return True
-    return datetime.now(timezone.utc) < parse_utc(get_trial_end_date(user_id))
+    now = datetime.now(timezone.utc)
+    if has_subscription(user_id, now):
+        return True
+    return now < parse_utc(get_trial_end_date(user_id))
+
+
+def has_subscription(user_id, now):
+    paid_until = get_paid_until(user_id)
+    return paid_until is not None and now < parse_utc(paid_until)
 
 
 def access_status_text(user_id):
     """Строка о доступе пользователя для /start и /help."""
     if is_admin(user_id):
         return "🔐 Вы администратор: доступ ко всем функциям без ограничений."
+    now = datetime.now(timezone.utc)
+    if has_subscription(user_id, now):
+        return f"💎 Подписка активна до {format_date(get_paid_until(user_id))}"
     trial_end_date = get_trial_end_date(user_id)
-    left = parse_utc(trial_end_date) - datetime.now(timezone.utc)
+    left = parse_utc(trial_end_date) - now
     if left.total_seconds() <= 0:
-        return "🔒 Пробный период закончился. Будем рады вашему отзыву: /feedback"
+        return "🔒 Пробный период закончился. Оформить подписку: /subscribe\nОставить отзыв: /feedback"
     # Округляем вверх: осталось 6 дней и 2 часа -> «7 дн.»
     days_left = left.days + (1 if left.seconds else 0)
     return f"⏳ Пробный период до {format_date(trial_end_date)} (осталось дней: {days_left})"
@@ -914,7 +933,7 @@ async def feedback_interested(callback: CallbackQuery, state: FSMContext):
     await state.update_data(is_interested=answer)
     await state.set_state(FeedbackForm.will_pay)
     await callback.message.answer(
-        "Шаг 2/3. Готовы ли вы платить 5$ в месяц за подписку?", reply_markup=FEEDBACK_PAY_KEYBOARD
+        "Шаг 2/3. Готовы ли вы оформить платную подписку для снятия лимитов?", reply_markup=FEEDBACK_PAY_KEYBOARD
     )
 
 
@@ -1049,6 +1068,94 @@ async def theory_button(callback: CallbackQuery):
 )
 async def theory_old_button(callback: CallbackQuery):
     await callback.answer(f"Эта кнопка устарела. Нажмите «{THEORY_TITLE}» в меню: /start", show_alert=True)
+
+
+# ============================================================
+# Подписка (/subscribe, оплата через Crypto Bot — payment.py)
+# ============================================================
+
+SUBSCRIBE_TEXT = (
+    "💳 Подписка на AI Aggregator\n\n"
+    "Полный доступ ко всем функциям: брифинги, ИИ-исследования, учебная справка и вопросы к ИИ.\n"
+    f"Оплата в {ASSET} через @CryptoBot.\n\n"
+    "👇 Выберите тариф:"
+)
+SUBSCRIBE_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text=f"📅 Месяц — {PLANS['month']['amount']} {ASSET}", callback_data="sub:month")],
+    [InlineKeyboardButton(text=f"💎 Год — {PLANS['year']['amount']} {ASSET}", callback_data="sub:year")],
+])
+INVOICE_ERROR_TEXT = "⚠️ Не удалось создать счёт. Попробуйте позже: /subscribe"
+PAYMENT_UNAVAILABLE_TEXT = "⚠️ Оплата временно недоступна. Попробуйте позже: /subscribe"
+NOT_PAID_TEXT = "Оплата пока не поступила. Если вы уже оплатили — подождите минуту и нажмите ещё раз."
+
+
+def invoice_keyboard(invoice):
+    """Кнопки под счётом: ссылка на оплату (если есть) и «Я оплатил»."""
+    rows = []
+    if invoice["pay_url"]:
+        rows.append([InlineKeyboardButton(text="💳 Оплатить", url=invoice["pay_url"])])
+    rows.append([InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{invoice['invoice_id']}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("subscribe"))
+async def cmd_subscribe(message: Message):
+    if not await check_allowed(message):
+        return
+    await message.answer(SUBSCRIBE_TEXT, reply_markup=SUBSCRIBE_KEYBOARD)
+
+
+@dp.callback_query(F.data.in_({f"sub:{plan}" for plan in PLANS}))
+async def subscribe_plan(callback: CallbackQuery):
+    """Выбран тариф — создаём счёт в Crypto Bot и отправляем ссылку на оплату."""
+    if not await callback_allowed(callback):
+        return
+    await callback.answer()
+    # Тестовый счёт «оплачивается» без денег — без токена разрешаем его только администратору
+    if not CRYPTO_BOT_TOKEN and not is_admin(callback.from_user.id):
+        logger.warning("Подписка недоступна: CRYPTO_BOT_TOKEN не задан (user_id=%s)", callback.from_user.id)
+        await callback.message.answer(PAYMENT_UNAVAILABLE_TEXT)
+        return
+    plan = callback.data.partition(":")[2]
+    info = PLANS[plan]
+    invoice = await create_invoice(callback.from_user.id, plan)
+    if invoice is None:
+        await callback.message.answer(INVOICE_ERROR_TEXT)
+        return
+    text = (
+        f"🧾 Счёт: подписка на {info['title'].lower()} — {info['amount']} {ASSET}\n\n"
+        "1. Нажмите «Оплатить» и подтвердите платёж в @CryptoBot.\n"
+        "2. Вернитесь сюда и нажмите «Я оплатил»."
+    )
+    if invoice["pay_url"] is None:
+        text += "\n\n🧪 Тестовый режим: CRYPTO_BOT_TOKEN не задан, ссылки на оплату нет."
+    await callback.message.answer(text, reply_markup=invoice_keyboard(invoice))
+
+
+@dp.callback_query(F.data.startswith("paid:"))
+async def payment_done(callback: CallbackQuery):
+    """Кнопка «Я оплатил»: проверяем счёт в Crypto Bot и продлеваем доступ."""
+    if not await callback_allowed(callback):
+        return
+    user_id = callback.from_user.id
+    invoice_id = callback.data.partition(":")[2]
+    plan = await check_payment(invoice_id, user_id)
+    if plan is None:
+        await callback.answer(NOT_PAID_TEXT, show_alert=True)
+        return
+    await callback.answer()
+    paid_until = activate_subscription(invoice_id, user_id, plan, PLANS[plan]["days"])
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        # Кнопки уже убраны (например, нажали дважды подряд)
+        pass
+    if paid_until is None:
+        await callback.message.answer(f"Этот счёт уже засчитан. {access_status_text(user_id)}")
+        return
+    await callback.message.answer(
+        f"✅ Оплата получена! Спасибо за подписку 🎉\n\n💎 Доступ ко всем функциям до {format_date(paid_until)}"
+    )
 
 
 # ============================================================
@@ -1194,6 +1301,7 @@ async def run_bot():
         BotCommand(command="research", description="🔬 ИИ: Исследование — /research вопрос"),
         BotCommand(command="theory", description="📖 Учебная справка по DeFi"),
         BotCommand(command="settings", description="⚙️ Настройки тем"),
+        BotCommand(command="subscribe", description="💳 Подписка"),
         BotCommand(command="feedback", description="💬 Фидбек"),
         BotCommand(command="help", description="❓ Справка"),
     ]
